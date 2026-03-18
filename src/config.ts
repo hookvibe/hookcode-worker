@@ -1,5 +1,6 @@
 import path from 'path';
 import type { WorkerKind } from './protocol';
+import { readWorkerCredentials, type WorkerCredentials } from './credentials';
 import { resolveWorkerWorkDirRoot } from './workDir';
 
 export interface WorkerConfig {
@@ -22,6 +23,11 @@ export interface WorkerConfig {
   execCommandTemplate?: string;
 }
 
+export interface WorkerRuntimeOptions {
+  workDirRoot: string;
+  bindCode?: string;
+}
+
 const trimString = (value: unknown): string => (typeof value === 'string' ? value.trim() : '');
 
 const parsePositiveInt = (value: unknown, fallback: number): number => {
@@ -42,20 +48,33 @@ export const buildWorkerWsUrl = (backendUrl: string, workerId: string, workerTok
   return `${wsBase}/workers/connect?${params.toString()}`;
 };
 
-export const parseWorkerConfig = (env: NodeJS.ProcessEnv = process.env): WorkerConfig => {
-  const backendUrl = trimString(env.HOOKCODE_BACKEND_URL).replace(/\/+$/, '');
-  const workerId = trimString(env.HOOKCODE_WORKER_ID);
-  const workerToken = trimString(env.HOOKCODE_WORKER_TOKEN);
-  if (!backendUrl) throw new Error('HOOKCODE_BACKEND_URL is required');
-  if (!workerId) throw new Error('HOOKCODE_WORKER_ID is required');
-  if (!workerToken) throw new Error('HOOKCODE_WORKER_TOKEN is required');
-
-  const workerKind: WorkerKind = trimString(env.HOOKCODE_WORKER_KIND) === 'remote' ? 'remote' : 'local';
+export const resolveWorkerRuntimeOptions = (env: NodeJS.ProcessEnv = process.env): WorkerRuntimeOptions => {
   const cwd = process.cwd();
   const workDirRoot = resolveWorkerWorkDirRoot(cwd, trimString(env.HOOKCODE_WORK_DIR));
+  return {
+    workDirRoot,
+    bindCode: trimString(env.HOOKCODE_WORKER_BIND_CODE) || undefined
+  };
+};
+
+export const parseWorkerConfig = (
+  env: NodeJS.ProcessEnv = process.env,
+  credentials?: WorkerCredentials | null,
+  options?: WorkerRuntimeOptions
+): WorkerConfig => {
+  const runtimeOptions = options ?? resolveWorkerRuntimeOptions(env);
+  const storedCredentials = credentials ?? readWorkerCredentials(runtimeOptions.workDirRoot);
+  const backendUrl = trimString(storedCredentials?.backendUrl).replace(/\/+$/, '');
+  const workerId = trimString(storedCredentials?.workerId);
+  const workerToken = trimString(storedCredentials?.workerToken);
+  if (!backendUrl || !workerId || !workerToken) {
+    throw new Error('Worker credentials are not configured. Run "hookcode-worker configure" first or provide HOOKCODE_WORKER_BIND_CODE.');
+  }
+
+  const workerKind: WorkerKind = trimString(env.HOOKCODE_WORKER_KIND) === 'remote' ? 'remote' : 'local';
   // Keep runtime installs and sticky workspaces colocated under HOOKCODE_WORK_DIR so worker storage is managed from a single root. docs/en/developer/plans/worker-executor-refactor-20260307/task_plan.md worker-executor-refactor-20260307
-  const runtimeInstallDir = path.join(workDirRoot, 'runtime');
-  const workspaceRootDir = path.join(workDirRoot, 'workspaces');
+  const runtimeInstallDir = path.join(runtimeOptions.workDirRoot, 'runtime');
+  const workspaceRootDir = path.join(runtimeOptions.workDirRoot, 'workspaces');
   const execCommandTemplate = trimString(env.HOOKCODE_WORKER_EXEC_COMMAND) || undefined;
 
   return {

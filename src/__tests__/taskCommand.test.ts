@@ -9,10 +9,12 @@ import {
 } from '../runtime/taskCommand';
 
 const config = parseWorkerConfig({
-  HOOKCODE_BACKEND_URL: 'https://example.com/api',
-  HOOKCODE_WORKER_ID: 'worker-1',
-  HOOKCODE_WORKER_TOKEN: 'secret',
   HOOKCODE_WORKER_EXEC_COMMAND: 'echo {{taskId}}'
+}, {
+  backendUrl: 'https://example.com/api',
+  workerId: 'worker-1',
+  workerToken: 'secret',
+  configuredAt: '2026-03-18T00:00:00.000Z'
 });
 
 describe('task command resolution', () => {

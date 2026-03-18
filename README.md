@@ -7,22 +7,40 @@ This package runs the HookCode worker process outside the main `hookcode` reposi
 ## Install
 
 ```bash
-npm install -g @hookvibe/hookcode-worker@0.1.0
+npm install -g @hookvibe/hookcode-worker@0.1.1
 ```
 
 Or run it without a global install:
 
 ```bash
-npx @hookvibe/hookcode-worker@0.1.0
+npx @hookvibe/hookcode-worker@0.1.1
 ```
 
 ## Usage
 
-Required environment variables:
+The worker now binds through a single one-time `bind code`.
 
-- `HOOKCODE_BACKEND_URL`
-- `HOOKCODE_WORKER_ID`
-- `HOOKCODE_WORKER_TOKEN`
+First-time manual install:
+
+```bash
+npm install -g @hookvibe/hookcode-worker@0.1.1
+
+HOOKCODE_WORK_DIR="$HOME/.hookcode/workers/worker-a" \
+HOOKCODE_WORKER_BIND_CODE="hcw1...." \
+hookcode-worker configure
+
+HOOKCODE_WORK_DIR="$HOME/.hookcode/workers/worker-a" \
+HOOKCODE_WORKER_KIND="remote" \
+HOOKCODE_WORKER_NAME="Build Host A" \
+HOOKCODE_WORKER_MAX_CONCURRENCY="1" \
+hookcode-worker run
+```
+
+The `configure` command exchanges the bind code for long-lived worker credentials and stores them under `HOOKCODE_WORK_DIR`. Later restarts only need `hookcode-worker run` from the same work dir.
+
+Required first-time environment variables:
+
+- `HOOKCODE_WORKER_BIND_CODE`
 
 Common optional variables:
 
@@ -31,18 +49,9 @@ Common optional variables:
 - `HOOKCODE_WORKER_MAX_CONCURRENCY`
 - `HOOKCODE_WORK_DIR`
 - `HOOKCODE_WORKER_PREVIEW`
+- `HOOKCODE_WORKER_FORCE_RECONFIGURE`
 
-Example:
-
-```bash
-HOOKCODE_BACKEND_URL="https://your-hookcode.example.com/api" \
-HOOKCODE_WORKER_ID="worker_xxx" \
-HOOKCODE_WORKER_TOKEN="token_xxx" \
-HOOKCODE_WORKER_NAME="Build Host A" \
-HOOKCODE_WORKER_KIND="remote" \
-HOOKCODE_WORKER_MAX_CONCURRENCY="1" \
-hookcode-worker
-```
+`HOOKCODE_WORKER_FORCE_RECONFIGURE=1` forces the worker to consume the provided bind code again instead of reusing any stored credentials. This is mainly for backend-managed local workers.
 
 ## Development
 
@@ -65,12 +74,11 @@ Run the packaged image directly:
 
 ```bash
 docker run --rm \
-  -e HOOKCODE_BACKEND_URL="https://your-hookcode.example.com/api" \
-  -e HOOKCODE_WORKER_ID="worker_xxx" \
-  -e HOOKCODE_WORKER_TOKEN="token_xxx" \
+  -e HOOKCODE_WORKER_BIND_CODE="hcw1...." \
   -e HOOKCODE_WORKER_NAME="Dedicated Remote Worker" \
   -e HOOKCODE_WORKER_KIND="remote" \
   -e HOOKCODE_WORKER_MAX_CONCURRENCY="1" \
-  ghcr.io/hookvibe/hookcode-worker:0.1.0
+  -e HOOKCODE_WORK_DIR="/var/lib/hookcode" \
+  -v hookcode-worker-data:/var/lib/hookcode \
+  ghcr.io/hookvibe/hookcode-worker:0.1.1
 ```
-
