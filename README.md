@@ -7,13 +7,31 @@ This package runs the HookCode worker process outside the main `hookcode` reposi
 ## Install
 
 ```bash
-npm install -g @hookvibe/hookcode-worker@0.1.1
+npm install -g @hookvibe/hookcode-worker@0.1.2
 ```
 
 Or run it without a global install:
 
 ```bash
-npx @hookvibe/hookcode-worker@0.1.1
+npx @hookvibe/hookcode-worker@0.1.2
+```
+
+Check the installed version:
+
+```bash
+hookcode-worker version
+```
+
+Upgrade from the CLI:
+
+```bash
+hookcode-worker upgrade --to 0.1.2
+```
+
+This wraps the equivalent global install command:
+
+```bash
+npm install -g @hookvibe/hookcode-worker@0.1.2
 ```
 
 ## Usage
@@ -23,7 +41,7 @@ The worker now binds through a single one-time `bind code`.
 First-time manual install:
 
 ```bash
-npm install -g @hookvibe/hookcode-worker@0.1.1
+npm install -g @hookvibe/hookcode-worker@0.1.2
 
 HOOKCODE_WORK_DIR="$HOME/.hookcode/workers/worker-a" \
 HOOKCODE_WORKER_BIND_CODE="hcw1...." \
@@ -80,5 +98,5 @@ docker run --rm \
   -e HOOKCODE_WORKER_MAX_CONCURRENCY="1" \
   -e HOOKCODE_WORK_DIR="/var/lib/hookcode" \
   -v hookcode-worker-data:/var/lib/hookcode \
-  ghcr.io/hookvibe/hookcode-worker:0.1.1
+  ghcr.io/hookvibe/hookcode-worker:0.1.2
 ```

@@ -1,9 +1,8 @@
 import { hostname } from 'os';
 import WebSocket from 'ws';
-import { readFileSync } from 'fs';
-import path from 'path';
 import { BackendInternalApiClient } from './backend/internalApiClient';
 import { parseWorkerConfig, WorkerConfig } from './config';
+import { readPackageVersion } from './packageInfo';
 import {
   BackendToWorkerMessage,
   isBackendToWorkerMessage,
@@ -31,16 +30,6 @@ interface ActiveTaskEntry {
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 const getErrorMessage = (error: unknown): string => (error instanceof Error ? error.message : String(error));
-
-const readPackageVersion = (): string | undefined => {
-  try {
-    const packageJsonPath = path.resolve(__dirname, '..', 'package.json');
-    const raw = JSON.parse(readFileSync(packageJsonPath, 'utf8')) as { version?: string };
-    return typeof raw.version === 'string' ? raw.version : undefined;
-  } catch {
-    return undefined;
-  }
-};
 
 export class WorkerProcess {
   private readonly config: WorkerConfig;

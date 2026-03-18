@@ -2,6 +2,8 @@
 import { registerWorkerBindCode } from './backend/registrationClient';
 import { parseWorkerConfig, resolveWorkerRuntimeOptions } from './config';
 import { readWorkerCredentials, writeWorkerCredentials, type WorkerCredentials } from './credentials';
+import { buildCliUpgradeCommand, buildGlobalInstallCommand, readPackageVersion } from './packageInfo';
+import { resolveUpgradeTargetArg, upgradeWorkerPackage } from './upgrade';
 import { WorkerProcess } from './workerProcess';
 
 const trimString = (value: unknown): string => (typeof value === 'string' ? value.trim() : '');
@@ -34,10 +36,24 @@ const configureWorker = async (bindCode: string, workDirRoot: string): Promise<W
 
 const main = async (): Promise<void> => {
   const argv = process.argv.slice(2);
-  const command = argv[0] === 'configure' || argv[0] === 'run' ? argv.shift()! : 'run';
+  const command =
+    argv[0] === 'configure' || argv[0] === 'run' || argv[0] === 'version' || argv[0] === 'upgrade' ? argv.shift()! : 'run';
   const runtimeOptions = resolveWorkerRuntimeOptions(process.env);
   const bindCode = resolveBindCodeArg(argv) ?? runtimeOptions.bindCode;
   const forceReconfigure = parseBoolean(process.env.HOOKCODE_WORKER_FORCE_RECONFIGURE);
+
+  if (command === 'version') {
+    console.log(readPackageVersion() || 'unknown');
+    return;
+  }
+
+  if (command === 'upgrade') {
+    const targetVersion = resolveUpgradeTargetArg(argv);
+    console.log(`[worker] upgrading via ${buildGlobalInstallCommand(targetVersion)}`);
+    await upgradeWorkerPackage(targetVersion);
+    console.log(`[worker] upgrade complete. Restart the worker process. Future shortcut: ${buildCliUpgradeCommand(targetVersion)}`);
+    return;
+  }
 
   if (command === 'configure') {
     if (!bindCode) {
