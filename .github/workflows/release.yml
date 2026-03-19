@@ -11,6 +11,8 @@ permissions:
 
 jobs:
   publish:
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     runs-on: self-hosted
     environment: Configure npm
     steps:
@@ -111,3 +113,47 @@ jobs:
             Published artifacts:
             - npm: `@hookvibe/hookcode-worker@${{ steps.version.outputs.version }}`
             - ghcr: `ghcr.io/hookvibe/hookcode-worker:${{ steps.version.outputs.version }}`
+
+  sync-hookcode:
+    needs: publish
+    runs-on: self-hosted
+    steps:
+      - name: Checkout hookcode dev
+        uses: actions/checkout@v4
+        with:
+          repository: hookvibe/hookcode
+          ref: dev
+          token: ${{ secrets.HOOKCODE_REPO_TOKEN }}
+          path: hookcode
+          clean: true
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.6.0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: hookcode/pnpm-lock.yaml
+
+      - name: Sync hookcode worker version
+        working-directory: hookcode
+        run: node scripts/update-worker-version.cjs "${{ needs.publish.outputs.version }}"
+
+      - name: Commit and push hookcode dev
+        working-directory: hookcode
+        env:
+          VERSION: ${{ needs.publish.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add backend/package.json backend/src/modules/workers/worker-version-policy.ts docker/.env.example docker/docker-compose.yml docker/ci/write-ci-env.sh package.json pnpm-lock.yaml scripts/update-worker-version.cjs
+          if git diff --cached --quiet; then
+            echo "No hookcode changes to commit"
+            exit 0
+          fi
+          git commit -m "chore: sync hookcode-worker to v${VERSION}"
+          git push origin HEAD:dev
