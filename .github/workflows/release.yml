@@ -117,6 +117,7 @@ jobs:
   sync-hookcode:
     needs: publish
     runs-on: self-hosted
+    environment: Configure npm
     steps:
       - name: Checkout hookcode dev
         uses: actions/checkout@v4
