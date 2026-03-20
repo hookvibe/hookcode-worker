@@ -17,6 +17,7 @@ import {
   resolvePreparedProviders,
   resolveTaskProvidersFromContext
 } from './runtime/prepareRuntime';
+import { WorkerTaskExecutionError } from './runtime/executionError';
 import { runTaskExecution } from './runtime/taskExecution';
 import { executeTaskWorkspaceOperation, TaskWorkspaceError } from './runtime/taskWorkspace';
 import { resolveTaskWorkspaceDir } from './runtime/taskCommand';
@@ -349,9 +350,12 @@ export class WorkerProcess {
         });
       }
     } catch (error) {
+      const executionError = error instanceof WorkerTaskExecutionError ? error : null;
       await this.client.finalizeTask(taskId, {
         status: 'failed',
         message: getErrorMessage(error),
+        providerCommentUrl: executionError?.providerCommentUrl,
+        gitStatus: executionError?.gitStatus,
         durationMs: Date.now() - startedAt,
         stopReason: activeTask.abortReason
       });

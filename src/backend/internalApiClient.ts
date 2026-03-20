@@ -6,6 +6,69 @@ export interface WorkerTaskContextResponse {
   defaultUserCredentials?: Record<string, unknown> | null;
 }
 
+export interface RemoteExecutionWorkspaceFile {
+  path: string;
+  contents: string;
+}
+
+export interface RemoteExecutionBundle {
+  taskId: string;
+  taskGroupId: string;
+  provider: 'gitlab' | 'github';
+  repoFolderName: string;
+  hasPriorTaskGroupTask: boolean;
+  hasTaskGroupLogs: boolean;
+  resumeThreadId?: string | null;
+  writeEnabled: boolean;
+  skipProviderPost: boolean;
+  checkout: {
+    ref?: string;
+    source: 'event' | 'robot' | 'repo' | 'payload' | 'none';
+  };
+  promptBase: string;
+  workspaceFiles: RemoteExecutionWorkspaceFile[];
+  git: {
+    cloneUrl: string;
+    displayCloneUrl: string;
+    pushUrl: string;
+    displayPushUrl: string;
+  };
+  repoWorkflow?: Record<string, unknown>;
+  gitIdentity?: {
+    userName: string;
+    userEmail: string;
+  };
+  providerRouting: Record<string, unknown>;
+  attempts: Array<{
+    provider: 'codex' | 'claude_code' | 'gemini_cli';
+    role: 'primary' | 'fallback';
+    runConfig: {
+      provider: 'codex' | 'claude_code' | 'gemini_cli';
+      normalized: Record<string, unknown>;
+      sandbox: 'read-only' | 'workspace-write';
+      networkAccess: boolean;
+      outputLastMessageFileName: string;
+    };
+    credential: {
+      provider: 'codex' | 'claude_code' | 'gemini_cli';
+      requestedStoredSource: string;
+      resolvedLayer: string;
+      resolvedMethod: string;
+      canExecute: boolean;
+      profileId?: string;
+      apiKey?: string;
+      apiBaseUrl?: string;
+      fallbackUsed: boolean;
+      reason?: string;
+    };
+  }>;
+  dependencyConfig?: {
+    enabled?: boolean;
+    failureMode?: 'soft' | 'hard';
+    allowCustomInstall?: boolean;
+  } | null;
+}
+
 const trimString = (value: unknown): string => (typeof value === 'string' ? value.trim() : '');
 
 export class BackendInternalApiClient {
@@ -71,9 +134,26 @@ export class BackendInternalApiClient {
     return this.request(`/tasks/${encodeURIComponent(taskId)}/control-state`, undefined, { allow404: true });
   }
 
-  executeInlineTask(taskId: string): Promise<{ success: true }> {
-    // Delegate local fallback execution back to backend only through the authenticated worker channel so remote workers keep the same API surface. docs/en/developer/plans/worker-executor-refactor-20260307/task_plan.md worker-executor-refactor-20260307
-    return this.request(`/tasks/${encodeURIComponent(taskId)}/execute-inline`, { method: 'POST' });
+  executeInlineTask(taskId: string, reason?: 'missing_command'): Promise<{ success: true }> {
+    // Route commandless-task fallback through one internal endpoint so backend can gate when assigned workers may delegate execution back inline. docs/en/developer/plans/worker-executor-refactor-20260307/task_plan.md worker-executor-refactor-20260307
+    return this.request(`/tasks/${encodeURIComponent(taskId)}/execute-inline`, {
+      method: 'POST',
+      body: JSON.stringify({ reason })
+    });
+  }
+
+  getTaskExecutionBundle(taskId: string): Promise<{ bundle: RemoteExecutionBundle }> {
+    return this.request(`/tasks/${encodeURIComponent(taskId)}/execution-bundle`);
+  }
+
+  postProviderResult(
+    taskId: string,
+    body: { status: 'succeeded' | 'failed'; outputText?: string; message?: string }
+  ): Promise<{ providerCommentUrl?: string }> {
+    return this.request(`/tasks/${encodeURIComponent(taskId)}/provider-result`, {
+      method: 'POST',
+      body: JSON.stringify(body)
+    });
   }
 
   appendLogs(taskId: string, startSeq: number, lines: string[]): Promise<{ success: true }> {

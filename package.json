@@ -1,6 +1,6 @@
 {
   "name": "@hookvibe/hookcode-worker",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Standalone HookCode worker runtime",
   "license": "MIT",
   "main": "dist/main.js",
@@ -17,6 +17,8 @@
     "build": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.json",
     "start": "node dist/main.js",
     "test": "jest -c jest.config.cjs --runInBand",
+    "release": "node scripts/release.mjs",
+    "release:prepare": "node scripts/release.mjs",
     "prepack": "pnpm build"
   },
   "repository": {
@@ -32,6 +34,7 @@
   },
   "packageManager": "pnpm@9.6.0",
   "dependencies": {
+    "yaml": "^2.8.1",
     "ws": "^8.19.0"
   },
   "devDependencies": {

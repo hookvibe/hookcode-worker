@@ -121,5 +121,14 @@ export const resolveTaskProvidersFromContext = (context: {
     ? context.robotsInRepo.find((entry) => String(entry?.id ?? '') === robotId)
     : undefined;
   const provider = typeof robot?.modelProvider === 'string' ? robot.modelProvider : 'codex';
-  return provider in PROVIDER_PACKAGES ? [provider] : ['codex'];
+  const routingConfig =
+    robot?.modelProviderConfig && typeof robot.modelProviderConfig === 'object' && !Array.isArray(robot.modelProviderConfig)
+      ? (robot.modelProviderConfig as Record<string, unknown>).routingConfig
+      : null;
+  const fallbackProvider =
+    routingConfig && typeof routingConfig === 'object' && !Array.isArray(routingConfig)
+      ? String((routingConfig as Record<string, unknown>).fallbackProvider ?? '').trim()
+      : '';
+  const providers = [provider, fallbackProvider].filter((entry) => entry in PROVIDER_PACKAGES);
+  return providers.length > 0 ? Array.from(new Set(providers)) : ['codex'];
 };

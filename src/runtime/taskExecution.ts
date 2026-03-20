@@ -5,6 +5,7 @@ import type { WorkerConfig } from '../config';
 import { stopChildProcessTree } from './crossPlatformSpawn';
 import { TaskLogBatcher } from './logBatcher';
 import { RepoChangeTracker } from './repoChangeTracker';
+import { runRemoteTaskExecution } from './remoteTaskExecution';
 import {
   buildTaskEnvironment,
   HydratedTaskMetadata,
@@ -172,9 +173,20 @@ export const runTaskExecution = async (params: {
 
     const resolvedCommand = resolveTaskCommand(task, params.config, metadata);
 
-    if (!resolvedCommand && params.config.workerKind === 'local') {
-      // Delegate missing-command local tasks back to backend inline execution so the supervised worker stays functional while the remote-safe executor envelope is still landing. docs/en/developer/plans/worker-executor-refactor-20260307/task_plan.md worker-executor-refactor-20260307
-      await params.client.executeInlineTask(params.taskId);
+    if (!resolvedCommand) {
+      if (params.config.workerKind === 'remote') {
+        return await runRemoteTaskExecution({
+          client: params.client,
+          config: params.config,
+          taskId: params.taskId,
+          task,
+          signal: params.signal,
+          stopReason: params.stopReason,
+          writeLine
+        });
+      }
+      // Delegate commandless tasks back to backend inline execution until every worker-targeted task ships a runnable command envelope. Backend revalidates this fallback so remote workers cannot arbitrarily tunnel command-capable tasks back inline. docs/en/developer/plans/worker-executor-refactor-20260307/task_plan.md worker-executor-refactor-20260307
+      await params.client.executeInlineTask(params.taskId, 'missing_command');
       return { handledByBackend: true };
     }
 
@@ -190,17 +202,6 @@ export const runTaskExecution = async (params: {
     writeLine(`[worker] injected env vars: ${envSummary.count}`);
     if (envSummary.redactedKeys.length > 0) {
       writeLine(`[worker] redacted secret-like env keys: ${envSummary.redactedKeys.join(', ')}`);
-    }
-
-    if (!resolvedCommand) {
-      const message = 'No task command was resolved from env or task payload.';
-      writeLine(`[worker] ${message}`);
-      if (params.config.noopOnMissingCommand) {
-        // Allow explicit noop mode for smoke tests so the standalone worker can validate wiring before the full agent runtime lands. docs/en/developer/plans/worker-executor-refactor-20260307/task_plan.md worker-executor-refactor-20260307
-        writeLine('[worker] noop mode is enabled; reporting success without spawning a task command.');
-        return { outputText: message };
-      }
-      throw new Error(message);
     }
 
     writeLine(`[worker] task command source: ${resolvedCommand.source}`);
