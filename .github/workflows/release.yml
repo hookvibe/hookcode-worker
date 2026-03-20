@@ -125,6 +125,7 @@ jobs:
           repository: hookvibe/hookcode
           ref: dev
           token: ${{ secrets.HOOKCODE_REPO_TOKEN }}
+          persist-credentials: false
           path: hookcode
           clean: true
 
@@ -148,13 +149,51 @@ jobs:
         working-directory: hookcode
         env:
           VERSION: ${{ needs.publish.outputs.version }}
+          HOOKCODE_REPO_TOKEN: ${{ secrets.HOOKCODE_REPO_TOKEN }}
         run: |
+          if [ -z "${HOOKCODE_REPO_TOKEN:-}" ]; then
+            echo "HOOKCODE_REPO_TOKEN is empty"
+            exit 1
+          fi
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config http.version HTTP/1.1
+          git remote set-url origin "https://x-access-token:${HOOKCODE_REPO_TOKEN}@github.com/hookvibe/hookcode.git"
+
           git add backend/package.json backend/src/modules/workers/worker-version-policy.ts docker/.env.example docker/docker-compose.yml docker/ci/write-ci-env.sh package.json pnpm-lock.yaml scripts/update-worker-version.cjs
           if git diff --cached --quiet; then
             echo "No hookcode changes to commit"
             exit 0
           fi
+
           git commit -m "chore: sync hookcode-worker to v${VERSION}"
-          git push origin HEAD:dev
+
+          attempt=1
+          max_attempts=4
+          while [ "${attempt}" -le "${max_attempts}" ]; do
+            echo "Push attempt ${attempt}/${max_attempts}"
+
+            if git push origin HEAD:dev; then
+              exit 0
+            fi
+
+            if [ "${attempt}" -eq "${max_attempts}" ]; then
+              echo "git push failed after ${max_attempts} attempts"
+              exit 1
+            fi
+
+            echo "git push failed, retrying after fetch/rebase"
+            if ! git fetch origin dev; then
+              echo "git fetch failed on attempt ${attempt}"
+            elif ! git rebase origin/dev; then
+              echo "git rebase origin/dev failed on attempt ${attempt}"
+              echo "sync-hookcode hit a real rebase conflict and cannot auto-resolve"
+              git status --short || true
+              git rebase --abort || true
+              exit 1
+            fi
+
+            sleep $((attempt * 5))
+            attempt=$((attempt + 1))
+          done
