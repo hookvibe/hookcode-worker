@@ -82,6 +82,19 @@ pnpm build
 pnpm dev
 ```
 
+Local development also supports a dedicated env file. The worker will auto-load `.env.worker.local` first, then `.env.worker`, from the current working directory. Existing shell environment variables still win over file values.
+
+```bash
+cp .env.worker.example .env.worker
+pnpm dev
+```
+
+To use a custom file path instead of the default discovery:
+
+```bash
+HOOKCODE_ENV_FILE=/absolute/path/to/local-worker.env pnpm dev
+```
+
 ## Docker
 
 The published image is pushed to:

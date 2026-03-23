@@ -37,17 +37,18 @@ const createLineWriter = (batcher: TaskLogBatcher) => {
 };
 
 const writeBufferedOutput = (writeLine: (line: string) => void, chunk: Buffer | string, buffer: { value: string }): void => {
-  const text = buffer.value + String(chunk);
+  const text = `${buffer.value}${String(chunk)}`.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
   const lines = text.split(/\n/);
   buffer.value = lines.pop() ?? '';
   for (const line of lines) {
-    writeLine(line);
+    if (line) writeLine(line);
   }
 };
 
 const flushBufferedOutput = (writeLine: (line: string) => void, buffer: { value: string }): void => {
   if (!buffer.value) return;
-  writeLine(buffer.value);
+  const safeLine = buffer.value.replace(/\r/g, '\n').trimEnd();
+  if (safeLine) writeLine(safeLine);
   buffer.value = '';
 };
 
@@ -158,6 +159,7 @@ export const runTaskExecution = async (params: {
   taskId: string;
   signal: AbortSignal;
   stopReason?: 'manual_stop' | 'deleted';
+  prepareRuntime?: (providers: string[]) => Promise<void>;
 }): Promise<TaskExecutionSuccess> => {
   const batcher = new TaskLogBatcher(params.client, params.taskId);
   const writeLine = createLineWriter(batcher);
@@ -182,7 +184,8 @@ export const runTaskExecution = async (params: {
           task,
           signal: params.signal,
           stopReason: params.stopReason,
-          writeLine
+          writeLine,
+          prepareRuntime: params.prepareRuntime
         });
       }
       // Delegate commandless tasks back to backend inline execution until every worker-targeted task ships a runnable command envelope. Backend revalidates this fallback so remote workers cannot arbitrarily tunnel command-capable tasks back inline. docs/en/developer/plans/worker-executor-refactor-20260307/task_plan.md worker-executor-refactor-20260307

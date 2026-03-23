@@ -4,6 +4,7 @@ import { copyFile, mkdir, readFile, writeFile } from 'fs/promises';
 import os from 'os';
 import path from 'path';
 import readline from 'readline';
+import { pathToFileURL } from 'url';
 import { stopChildProcessTree } from './crossPlatformSpawn';
 import { buildMergedProcessEnv, createAsyncLineLogger, normalizeHttpBaseUrl } from './providerRuntime';
 
@@ -12,6 +13,57 @@ const nodeRequire = createRequire(__filename);
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+
+/**
+ * Resolve the ESM entry-point of a package that only exposes ESM exports.
+ *
+ * `require.resolve()` cannot resolve ESM-only packages because they have no
+ * `require` condition in their `exports` map.  This helper walks the same
+ * search paths that `require` would use, reads `package.json`, and returns
+ * the file URL of the `import` entry-point so it can be passed to
+ * `dynamicImport()`.
+ */
+const resolveEsmPackageEntrypoint = (specifier: string): string | null => {
+  const searchPaths = nodeRequire.resolve.paths(specifier) ?? [];
+  for (const searchPath of searchPaths) {
+    const pkgDir = path.join(searchPath, ...specifier.split('/'));
+    const pkgJsonPath = path.join(pkgDir, 'package.json');
+    try {
+      const raw = require('fs').readFileSync(pkgJsonPath, 'utf8') as string;
+      const pkg = JSON.parse(raw) as Record<string, unknown>;
+      const exportsMain = isRecord(pkg.exports) ? pkg.exports['.'] : pkg.exports;
+      const importPath =
+        typeof exportsMain === 'string'
+          ? exportsMain
+          : isRecord(exportsMain)
+            ? (exportsMain.import as string | undefined) ?? (exportsMain.default as string | undefined)
+            : undefined;
+      const entryRel = importPath ?? (pkg.module as string | undefined) ?? (pkg.main as string | undefined);
+      if (typeof entryRel === 'string' && entryRel) return path.resolve(pkgDir, entryRel);
+    } catch {
+      /* continue to next search path */
+    }
+  }
+  return null;
+};
+
+const importResolvedPackage = async (specifier: string): Promise<Record<string, unknown>> => {
+  let resolvedPath: string;
+  try {
+    resolvedPath = nodeRequire.resolve(specifier);
+  } catch (error: unknown) {
+    // ESM-only packages (e.g. @openai/codex-sdk) have no CJS "require" export
+    // so require.resolve() throws ERR_PACKAGE_PATH_NOT_EXPORTED.  Manually
+    // resolve the ESM entry-point and import via file URL.
+    if (error instanceof Error && 'code' in error && error.code === 'ERR_PACKAGE_PATH_NOT_EXPORTED') {
+      const esmEntry = resolveEsmPackageEntrypoint(specifier);
+      if (!esmEntry) throw error;
+      return (await dynamicImport(pathToFileURL(esmEntry).href)) as Record<string, unknown>;
+    }
+    throw error;
+  }
+  return (await dynamicImport(pathToFileURL(resolvedPath).href)) as Record<string, unknown>;
+};
 
 const toSafeJsonLine = (value: unknown): string => {
   try {
@@ -125,7 +177,11 @@ export const runCodexExecWithSdk = async (params: {
   logLine?: (line: string) => Promise<void>;
 }): Promise<{ threadId: string | null; finalResponse: string }> => {
   const prompt = await readFile(params.promptFile, 'utf8');
-  const { Codex } = (await dynamicImport('@openai/codex-sdk')) as { Codex: any };
+  const codexModule = await importResolvedPackage('@openai/codex-sdk');
+  const Codex = (codexModule.Codex ?? (isRecord(codexModule.default) ? codexModule.default.Codex : undefined)) as any;
+  if (!Codex) {
+    throw new Error('Failed to load Codex SDK: missing Codex export');
+  }
   const codexInitOptions: Record<string, unknown> = {
     baseUrl: normalizeHttpBaseUrl(params.apiBaseUrl ?? ''),
     env: buildMergedProcessEnv(params.env)
@@ -258,7 +314,11 @@ export const runClaudeCodeExecWithSdk = async (params: {
   logLine?: (line: string) => Promise<void>;
 }): Promise<{ threadId: string | null; finalResponse: string }> => {
   const prompt = await readFile(params.promptFile, 'utf8');
-  const { query } = (await dynamicImport('@anthropic-ai/claude-agent-sdk')) as { query: Function };
+  const claudeModule = await importResolvedPackage('@anthropic-ai/claude-agent-sdk');
+  const query = (claudeModule.query ?? (isRecord(claudeModule.default) ? claudeModule.default.query : undefined)) as Function | undefined;
+  if (typeof query !== 'function') {
+    throw new Error('Failed to load Claude Agent SDK: missing query export');
+  }
   const abortController = new AbortController();
   if (params.signal) {
     if (params.signal.aborted) abortController.abort(params.signal.reason);

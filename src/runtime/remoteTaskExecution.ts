@@ -6,6 +6,7 @@ import { BackendInternalApiClient, type RemoteExecutionBundle } from '../backend
 import type { WorkerConfig } from '../config';
 import { stopChildProcessTree, xSpawnSync } from './crossPlatformSpawn';
 import { WorkerTaskExecutionError } from './executionError';
+import { prepareRuntimeProviders, resolvePreparedProviders } from './prepareRuntime';
 import { runClaudeCodeExecWithSdk, runCodexExecWithSdk, runGeminiCliExecWithCli } from './providerRunners';
 import { RepoChangeTracker } from './repoChangeTracker';
 import {
@@ -117,20 +118,49 @@ const writeBufferedOutput = (
   chunk: Buffer | string,
   buffer: { value: string }
 ) => {
-  const text = buffer.value + String(chunk);
+  const text = `${buffer.value}${String(chunk)}`.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
   const lines = text.split(/\n/);
   buffer.value = lines.pop() ?? '';
   if (!writeLine) return;
   for (const line of lines) {
-    const safeLine = line.replace(/\r/g, '');
-    if (safeLine) writeLine(safeLine);
+    if (line) writeLine(line);
   }
 };
 
 const flushBufferedOutput = (writeLine: ((line: string) => void) | undefined, buffer: { value: string }) => {
-  const safeLine = buffer.value.replace(/\r/g, '');
+  const safeLine = buffer.value.replace(/\r/g, '\n').trimEnd();
   buffer.value = '';
   if (writeLine && safeLine) writeLine(safeLine);
+};
+
+const ensureProviderRuntimesPrepared = async (params: {
+  config: WorkerConfig;
+  bundle: RemoteExecutionBundle;
+  writeLine: (line: string) => void;
+  prepareRuntime?: (providers: string[]) => Promise<void>;
+}) => {
+  const providers = Array.from(new Set(params.bundle.attempts.map((attempt) => trimString(attempt.provider)).filter(Boolean)));
+  if (!providers.length) return;
+
+  params.writeLine(`[worker] ensuring provider runtimes: ${providers.join(', ')}`);
+
+  // Use the WorkerProcess-level prepareRuntime callback when available.
+  // This routes through the process-wide mutex and keeps runtimeState in sync
+  // with heartbeat reporting.  Falls back to the module-level serialised
+  // prepareRuntimeProviders() for direct invocations outside WorkerProcess.
+  if (params.prepareRuntime) {
+    await params.prepareRuntime(providers);
+  } else {
+    await prepareRuntimeProviders(params.config.runtimeInstallDir, providers);
+  }
+
+  // Lightweight verification — resolvePreparedProviders() just calls
+  // require.resolve() without triggering another install pass.
+  const preparedProviders = resolvePreparedProviders();
+  const missingProviders = providers.filter((provider) => !preparedProviders.includes(provider));
+  if (missingProviders.length > 0) {
+    throw new Error(`worker runtime prepare failed for providers: ${missingProviders.join(', ')}`);
+  }
 };
 
 const streamCommand = async (params: {
@@ -860,6 +890,7 @@ export const runRemoteTaskExecution = async (params: {
   signal: AbortSignal;
   stopReason?: 'manual_stop' | 'deleted';
   writeLine: (line: string) => void;
+  prepareRuntime?: (providers: string[]) => Promise<void>;
 }): Promise<RemoteTaskExecutionSuccess> => {
   const bundle = (await params.client.getTaskExecutionBundle(params.taskId)).bundle;
   const workspaceDir = path.join(params.config.workspaceRootDir, bundle.taskGroupId);
@@ -893,6 +924,13 @@ export const runRemoteTaskExecution = async (params: {
       },
       'processing'
     );
+
+    await ensureProviderRuntimesPrepared({
+      config: params.config,
+      bundle,
+      writeLine: params.writeLine,
+      prepareRuntime: params.prepareRuntime
+    });
 
     const { reuseWorkspace } = await prepareRepository({
       bundle,

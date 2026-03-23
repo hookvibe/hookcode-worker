@@ -43,6 +43,7 @@ export class WorkerProcess {
   private runtimeState: WorkerRuntimeState;
   private preparingRuntimePromise: Promise<void> | null = null;
   private capabilities: WorkerCapabilities;
+  private shuttingDown = false;
 
   constructor(config: WorkerConfig = parseWorkerConfig()) {
     this.config = config;
@@ -61,6 +62,54 @@ export class WorkerProcess {
   async start(): Promise<void> {
     // Keep the standalone worker alive across initial dial failures so local/remote executors retry instead of exiting with code 1. docs/en/developer/plans/worker-executor-refactor-20260307/task_plan.md worker-executor-refactor-20260307
     await this.connect();
+  }
+
+  /**
+   * Gracefully shut down the worker: abort all active tasks, clear the queue,
+   * close the WebSocket, and stop all timers.  Returns after all active tasks
+   * have settled so that finalization messages are sent before the process
+   * exits.
+   */
+  async shutdown(): Promise<void> {
+    if (this.shuttingDown) return;
+    this.shuttingDown = true;
+
+    // Clear pending queue so no new tasks start.
+    this.pendingTaskIds.length = 0;
+
+    // Abort every active task and wait for them to settle.
+    const inflight: Promise<void>[] = [];
+    for (const [taskId, entry] of this.activeTasks) {
+      entry.abortReason = 'manual_stop';
+      entry.abortController.abort();
+      // startTask's try-catch-finally will handle finalization and removal
+      // from activeTasks; we just need to wait for that to complete.
+      inflight.push(
+        new Promise<void>((resolve) => {
+          const check = setInterval(() => {
+            if (!this.activeTasks.has(taskId)) {
+              clearInterval(check);
+              resolve();
+            }
+          }, 50);
+        })
+      );
+    }
+    if (inflight.length > 0) {
+      // Give tasks a reasonable window to finalize.
+      await Promise.race([Promise.all(inflight), sleep(10_000)]);
+    }
+
+    // Tear down heartbeat and WebSocket.
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
+    if (this.socket) {
+      this.socket.removeAllListeners();
+      this.socket.close();
+      this.socket = null;
+    }
   }
 
   private currentActiveTaskIds(): string[] {
@@ -146,7 +195,9 @@ export class WorkerProcess {
   }
 
   private async scheduleReconnect(): Promise<void> {
+    if (this.shuttingDown) return;
     await sleep(this.reconnectDelayMs);
+    if (this.shuttingDown) return;
     this.reconnectDelayMs = Math.min(this.reconnectDelayMs * 2, this.config.reconnectMaxMs);
     try {
       await this.connect();
@@ -206,8 +257,20 @@ export class WorkerProcess {
   }
 
   private async prepareRuntime(providers?: string[]): Promise<void> {
-    if (this.preparingRuntimePromise) return this.preparingRuntimePromise;
     const targetProviders = providers && providers.length > 0 ? providers : ['codex', 'claude_code', 'gemini_cli'];
+
+    // If an install is already running, wait for it to finish first.
+    // After it completes, check whether the requested providers are now
+    // satisfied.  If any are still missing, a follow-up install pass will
+    // run (serialised by the module-level mutex in prepareRuntimeProviders).
+    if (this.preparingRuntimePromise) {
+      await this.preparingRuntimePromise;
+      const alreadyPrepared = this.runtimeState.preparedProviders ?? [];
+      const stillMissing = targetProviders.filter((p) => !alreadyPrepared.includes(p));
+      if (stillMissing.length === 0) return;
+      // Fall through to trigger a follow-up install for the missing providers.
+    }
+
     this.runtimeState = {
       ...this.runtimeState,
       preparingProviders: targetProviders,
@@ -307,10 +370,10 @@ export class WorkerProcess {
   }
 
   private async drainQueue(): Promise<void> {
-    while (this.activeTasks.size < this.config.maxConcurrency && this.pendingTaskIds.length > 0) {
+    while (!this.shuttingDown && this.activeTasks.size < this.config.maxConcurrency && this.pendingTaskIds.length > 0) {
       const taskId = this.pendingTaskIds.shift();
       if (!taskId) return;
-      void this.startTask(taskId);
+      this.startTask(taskId).catch((err) => console.error('[worker] startTask unexpected error', { taskId, error: getErrorMessage(err) }));
     }
   }
 
@@ -337,7 +400,8 @@ export class WorkerProcess {
         context,
         taskId,
         signal: activeTask.abortController.signal,
-        stopReason: activeTask.abortReason
+        stopReason: activeTask.abortReason,
+        prepareRuntime: (p) => this.prepareRuntime(p)
       });
       if (!result.handledByBackend) {
         // Skip duplicate finalization when the local worker delegated execution back to backend inline mode. docs/en/developer/plans/worker-executor-refactor-20260307/task_plan.md worker-executor-refactor-20260307

@@ -1,5 +1,5 @@
 import type { SpawnSyncOptions, SpawnSyncReturns } from 'child_process';
-import { mkdir, writeFile } from 'fs/promises';
+import { mkdir, readFile, writeFile } from 'fs/promises';
 import path from 'path';
 import type { WorkerRuntimeState } from '../protocol';
 import { xSpawn, xSpawnSync } from './crossPlatformSpawn';
@@ -9,14 +9,47 @@ const PROVIDER_PACKAGES: Record<string, string[]> = {
   claude_code: ['@anthropic-ai/claude-agent-sdk'],
   gemini_cli: ['@google/gemini-cli']
 };
+const PNPM_PACKAGE_MANAGER = 'pnpm@9.6.0';
+
+/**
+ * Module-level mutex that serialises all provider SDK install operations.
+ * Both WorkerProcess.prepareRuntime() and remoteTaskExecution's
+ * ensureProviderRuntimesPrepared() ultimately call prepareRuntimeProviders()
+ * which passes through this lock, preventing concurrent npm/pnpm writes to
+ * the same vendor directory.
+ */
+let activeInstallPromise: Promise<WorkerRuntimeState> | null = null;
+
+type VendorManifest = {
+  name?: string;
+  private?: boolean;
+  packageManager?: string;
+  dependencies?: Record<string, string>;
+};
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 const packageIsResolvable = (pkg: string): boolean => {
   try {
     require.resolve(pkg);
     return true;
-  } catch {
+  } catch (error: unknown) {
+    // ESM-only packages (e.g. @openai/codex-sdk) throw ERR_PACKAGE_PATH_NOT_EXPORTED
+    // because their exports map has no "require" condition.  The package IS
+    // installed — it just cannot be loaded via require().  Treat this as success.
+    if (error instanceof Error && 'code' in error && error.code === 'ERR_PACKAGE_PATH_NOT_EXPORTED') {
+      return true;
+    }
     return false;
   }
+};
+
+const packageIsResolvableWithRetry = async (pkg: string, retries = 3, delayMs = 500): Promise<boolean> => {
+  for (let i = 0; i < retries; i += 1) {
+    if (packageIsResolvable(pkg)) return true;
+    if (i < retries - 1) await sleep(delayMs);
+  }
+  return false;
 };
 
 const applyNodePath = (vendorDir: string): void => {
@@ -43,8 +76,29 @@ export const detectNpmCommand = (
 
 const installPackages = async (vendorDir: string, packages: string[]): Promise<void> => {
   await mkdir(vendorDir, { recursive: true });
-  await writeFile(path.join(vendorDir, 'package.json'), JSON.stringify({ name: 'hookcode-worker-vendor', private: true }, null, 2));
   const { command, args } = detectNpmCommand();
+  const packageJsonPath = path.join(vendorDir, 'package.json');
+  let manifest: VendorManifest = { name: 'hookcode-worker-vendor', private: true };
+
+  try {
+    const raw = await readFile(packageJsonPath, 'utf8');
+    const parsed = JSON.parse(raw) as VendorManifest;
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      manifest = {
+        ...parsed,
+        name: typeof parsed.name === 'string' && parsed.name.trim() ? parsed.name : 'hookcode-worker-vendor',
+        private: true
+      };
+    }
+  } catch {
+    manifest = { name: 'hookcode-worker-vendor', private: true };
+  }
+
+  if (command === 'pnpm') {
+    manifest.packageManager = PNPM_PACKAGE_MANAGER;
+  }
+
+  await writeFile(packageJsonPath, `${JSON.stringify(manifest, null, 2)}\n`);
   await new Promise<void>((resolve, reject) => {
     const child = xSpawn(command, [...args, ...packages], {
       cwd: vendorDir,
@@ -73,12 +127,14 @@ export const resolvePreparedProviders = (): string[] => {
     .map(([provider]) => provider);
 };
 
-export const prepareRuntimeProviders = async (
+/**
+ * Internal implementation — callers go through the serialised wrapper below.
+ */
+const prepareRuntimeProvidersInternal = async (
   vendorDir: string,
-  providers?: string[],
+  targets: string[],
   priorState?: WorkerRuntimeState
 ): Promise<WorkerRuntimeState> => {
-  const targets = Array.from(new Set((providers ?? Object.keys(PROVIDER_PACKAGES)).filter((provider) => provider in PROVIDER_PACKAGES)));
   const runtimeState: WorkerRuntimeState = {
     preparedProviders: priorState?.preparedProviders ?? resolvePreparedProviders(),
     preparingProviders: targets,
@@ -95,6 +151,22 @@ export const prepareRuntimeProviders = async (
       // Install provider runtimes only when requested so the distributed worker package can remain small by default. docs/en/developer/plans/worker-executor-refactor-20260307/task_plan.md worker-executor-refactor-20260307
       await installPackages(vendorDir, missingPackages);
       applyNodePath(vendorDir);
+
+      // Verify packages are actually resolvable after install (file system caching may delay visibility).
+      const stillMissing: string[] = [];
+      for (const pkg of missingPackages) {
+        if (!(await packageIsResolvableWithRetry(pkg))) {
+          stillMissing.push(pkg);
+        }
+      }
+      if (stillMissing.length > 0) {
+        return {
+          preparedProviders: resolvePreparedProviders(),
+          preparingProviders: [],
+          lastPrepareAt: new Date().toISOString(),
+          lastPrepareError: `packages installed but not resolvable: ${stillMissing.join(', ')}`
+        };
+      }
     }
     return {
       preparedProviders: resolvePreparedProviders(),
@@ -109,6 +181,53 @@ export const prepareRuntimeProviders = async (
       lastPrepareAt: new Date().toISOString(),
       lastPrepareError: error instanceof Error ? error.message : String(error)
     };
+  }
+};
+
+/**
+ * Serialised entry-point for provider SDK installation.
+ *
+ * A module-level promise lock ensures only one npm/pnpm install process runs
+ * at a time.  When a second caller arrives while an install is in-flight the
+ * new request is queued: the existing promise is awaited first, then the
+ * remaining (not-yet-prepared) providers are installed in a follow-up pass.
+ */
+export const prepareRuntimeProviders = async (
+  vendorDir: string,
+  providers?: string[],
+  priorState?: WorkerRuntimeState
+): Promise<WorkerRuntimeState> => {
+  const targets = Array.from(new Set((providers ?? Object.keys(PROVIDER_PACKAGES)).filter((provider) => provider in PROVIDER_PACKAGES)));
+
+  // Wait for any in-flight install to finish before starting a new one.
+  if (activeInstallPromise) {
+    try {
+      await activeInstallPromise;
+    } catch {
+      // Prior install failed — we still want to attempt our own.
+    }
+  }
+
+  // After waiting, some or all requested providers may already be prepared.
+  const alreadyPrepared = resolvePreparedProviders();
+  const remaining = targets.filter((provider) => !alreadyPrepared.includes(provider));
+  if (remaining.length === 0) {
+    return {
+      preparedProviders: alreadyPrepared,
+      preparingProviders: [],
+      lastPrepareAt: new Date().toISOString(),
+      lastPrepareError: undefined
+    };
+  }
+
+  const promise = prepareRuntimeProvidersInternal(vendorDir, remaining, priorState);
+  activeInstallPromise = promise;
+  try {
+    return await promise;
+  } finally {
+    if (activeInstallPromise === promise) {
+      activeInstallPromise = null;
+    }
   }
 };
 
