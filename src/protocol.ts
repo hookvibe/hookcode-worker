@@ -1,23 +1,24 @@
 export type WorkerKind = 'local' | 'remote';
 export type WorkerProviderKey = 'codex' | 'claude_code' | 'gemini_cli';
-export type WorkerProviderRuntimeStatus = 'idle' | 'preparing' | 'ready' | 'error';
+export type WorkerProviderRuntimeStatus = 'idle' | 'ready' | 'error';
 
 export interface WorkerProviderRuntimeEntry {
   status: WorkerProviderRuntimeStatus;
-  startedAt?: string;
-  finishedAt?: string;
+  checkedAt?: string;
+  command?: string;
+  path?: string;
+  version?: string;
   error?: string;
 }
 
 export type WorkerProviderRuntimeStatuses = Partial<Record<WorkerProviderKey, WorkerProviderRuntimeEntry>>;
 
 export interface WorkerRuntimeState {
-  // Carry provider-level install progress so the backend can surface live Codex/Claude/Gemini readiness instead of one opaque runtime flag. docs/en/developer/plans/7i9tp61el8rrb4r7j5xj/task_plan.md 7i9tp61el8rrb4r7j5xj
+  // Carry provider-level environment detection results so the backend can surface live Codex/Claude/Gemini availability from the host machine. docs/en/developer/plans/7i9tp61el8rrb4r7j5xj/task_plan.md 7i9tp61el8rrb4r7j5xj
   providerStatuses?: WorkerProviderRuntimeStatuses;
-  preparedProviders?: WorkerProviderKey[];
-  preparingProviders?: WorkerProviderKey[];
-  lastPrepareAt?: string;
-  lastPrepareError?: string;
+  availableProviders?: WorkerProviderKey[];
+  lastCheckedAt?: string;
+  lastCheckError?: string;
 }
 
 export interface WorkerCapabilities {
@@ -49,19 +50,6 @@ export type WorkerTaskAcceptedMessage = {
   taskId: string;
 };
 
-export type WorkerRuntimePrepareStartedMessage = {
-  type: 'runtimePrepareStarted';
-  providers?: WorkerProviderKey[];
-  runtimeState?: WorkerRuntimeState;
-};
-
-export type WorkerRuntimePrepareFinishedMessage = {
-  type: 'runtimePrepareFinished';
-  providers?: WorkerProviderKey[];
-  runtimeState?: WorkerRuntimeState;
-  error?: string;
-};
-
 export type WorkerWorkspaceResponseMessage = {
   type: 'workspaceResponse';
   requestId: string;
@@ -78,18 +66,11 @@ export type WorkerToBackendMessage =
   | WorkerHelloMessage
   | WorkerHeartbeatMessage
   | WorkerTaskAcceptedMessage
-  | WorkerRuntimePrepareStartedMessage
-  | WorkerRuntimePrepareFinishedMessage
   | WorkerWorkspaceResponseMessage;
 
 export type WorkerAssignTaskMessage = {
   type: 'assignTask';
   taskId: string;
-};
-
-export type WorkerPrepareRuntimeMessage = {
-  type: 'prepareRuntime';
-  providers?: WorkerProviderKey[];
 };
 
 export type WorkerCancelTaskMessage = {
@@ -114,7 +95,6 @@ export type WorkerWorkspaceRequestMessage = {
 
 export type BackendToWorkerMessage =
   | WorkerAssignTaskMessage
-  | WorkerPrepareRuntimeMessage
   | WorkerCancelTaskMessage
   | WorkerPingMessage
   | WorkerWorkspaceRequestMessage;
@@ -125,7 +105,6 @@ export const isBackendToWorkerMessage = (value: unknown): value is BackendToWork
   const type = String((value as { type?: unknown }).type ?? '');
   return (
     type === 'assignTask' ||
-    type === 'prepareRuntime' ||
     type === 'cancelTask' ||
     type === 'ping' ||
     type === 'workspaceRequest'

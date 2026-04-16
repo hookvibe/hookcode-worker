@@ -159,7 +159,6 @@ export const runTaskExecution = async (params: {
   taskId: string;
   signal: AbortSignal;
   stopReason?: 'manual_stop' | 'deleted';
-  prepareRuntime?: (providers: string[]) => Promise<void>;
 }): Promise<TaskExecutionSuccess> => {
   const batcher = new TaskLogBatcher(params.client, params.taskId);
   const writeLine = createLineWriter(batcher);
@@ -184,8 +183,7 @@ export const runTaskExecution = async (params: {
           task,
           signal: params.signal,
           stopReason: params.stopReason,
-          writeLine,
-          prepareRuntime: params.prepareRuntime
+          writeLine
         });
       }
       // Delegate commandless tasks back to backend inline execution until every worker-targeted task ships a runnable command envelope. Backend revalidates this fallback so remote workers cannot arbitrarily tunnel command-capable tasks back inline. docs/en/developer/plans/worker-executor-refactor-20260307/task_plan.md worker-executor-refactor-20260307

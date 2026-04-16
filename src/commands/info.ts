@@ -1,7 +1,7 @@
 import { readWorkerCredentials } from '../credentials';
 import { resolveWorkerRuntimeOptions, parseWorkerConfig } from '../config';
 import { readPackageVersion } from '../packageInfo';
-import { resolvePreparedProviders } from '../runtime/prepareRuntime';
+import { detectWorkerRuntimeState } from '../runtime/runtimeDetection';
 import { getWorkerProcessStatus } from '../pidFile';
 
 export const showInfo = (workDirRoot: string): void => {
@@ -46,7 +46,7 @@ export const showInfo = (workDirRoot: string): void => {
     // Config parsing may fail if env is incomplete — that's fine for info display.
   }
 
-  const prepared = resolvePreparedProviders();
-  console.log(`  Providers ready:  ${prepared.length > 0 ? prepared.join(', ') : 'none'}`);
+  const availableProviders = detectWorkerRuntimeState().availableProviders ?? [];
+  console.log(`  Providers found:  ${availableProviders.length > 0 ? availableProviders.join(', ') : 'none'}`);
   console.log('');
 };

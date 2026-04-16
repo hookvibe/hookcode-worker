@@ -47,6 +47,17 @@ jest.mock('ws', () => ({
   default: MockWebSocket
 }));
 
+jest.mock('../runtime/runtimeDetection', () => ({
+  detectWorkerRuntimeState: jest.fn(() => ({
+    availableProviders: ['codex'],
+    providerStatuses: {
+      codex: { status: 'ready', checkedAt: '2026-04-16T00:00:00.000Z' }
+    },
+    lastCheckedAt: '2026-04-16T00:00:00.000Z'
+  })),
+  resolveTaskProvidersFromContext: jest.fn(() => ['codex'])
+}));
+
 import { WorkerProcess } from '../workerProcess';
 
 describe('WorkerProcess.start', () => {

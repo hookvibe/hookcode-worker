@@ -1,69 +1,15 @@
 import { spawn } from 'child_process';
-import { createRequire } from 'module';
-import { copyFile, mkdir, readFile, writeFile } from 'fs/promises';
+import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from 'fs/promises';
 import os from 'os';
 import path from 'path';
 import readline from 'readline';
-import { pathToFileURL } from 'url';
 import { stopChildProcessTree } from './crossPlatformSpawn';
 import { buildMergedProcessEnv, createAsyncLineLogger, normalizeHttpBaseUrl } from './providerRuntime';
 
-const dynamicImport = new Function('specifier', 'return import(specifier)') as (specifier: string) => Promise<unknown>;
-const nodeRequire = createRequire(__filename);
+const trimString = (value: unknown): string => (typeof value === 'string' ? value.trim() : '');
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   Boolean(value) && typeof value === 'object' && !Array.isArray(value);
-
-/**
- * Resolve the ESM entry-point of a package that only exposes ESM exports.
- *
- * `require.resolve()` cannot resolve ESM-only packages because they have no
- * `require` condition in their `exports` map.  This helper walks the same
- * search paths that `require` would use, reads `package.json`, and returns
- * the file URL of the `import` entry-point so it can be passed to
- * `dynamicImport()`.
- */
-const resolveEsmPackageEntrypoint = (specifier: string): string | null => {
-  const searchPaths = nodeRequire.resolve.paths(specifier) ?? [];
-  for (const searchPath of searchPaths) {
-    const pkgDir = path.join(searchPath, ...specifier.split('/'));
-    const pkgJsonPath = path.join(pkgDir, 'package.json');
-    try {
-      const raw = require('fs').readFileSync(pkgJsonPath, 'utf8') as string;
-      const pkg = JSON.parse(raw) as Record<string, unknown>;
-      const exportsMain = isRecord(pkg.exports) ? pkg.exports['.'] : pkg.exports;
-      const importPath =
-        typeof exportsMain === 'string'
-          ? exportsMain
-          : isRecord(exportsMain)
-            ? (exportsMain.import as string | undefined) ?? (exportsMain.default as string | undefined)
-            : undefined;
-      const entryRel = importPath ?? (pkg.module as string | undefined) ?? (pkg.main as string | undefined);
-      if (typeof entryRel === 'string' && entryRel) return path.resolve(pkgDir, entryRel);
-    } catch {
-      /* continue to next search path */
-    }
-  }
-  return null;
-};
-
-const importResolvedPackage = async (specifier: string): Promise<Record<string, unknown>> => {
-  let resolvedPath: string;
-  try {
-    resolvedPath = nodeRequire.resolve(specifier);
-  } catch (error: unknown) {
-    // ESM-only packages (e.g. @openai/codex-sdk) have no CJS "require" export
-    // so require.resolve() throws ERR_PACKAGE_PATH_NOT_EXPORTED.  Manually
-    // resolve the ESM entry-point and import via file URL.
-    if (error instanceof Error && 'code' in error && error.code === 'ERR_PACKAGE_PATH_NOT_EXPORTED') {
-      const esmEntry = resolveEsmPackageEntrypoint(specifier);
-      if (!esmEntry) throw error;
-      return (await dynamicImport(pathToFileURL(esmEntry).href)) as Record<string, unknown>;
-    }
-    throw error;
-  }
-  return (await dynamicImport(pathToFileURL(resolvedPath).href)) as Record<string, unknown>;
-};
 
 const toSafeJsonLine = (value: unknown): string => {
   try {
@@ -73,90 +19,166 @@ const toSafeJsonLine = (value: unknown): string => {
   }
 };
 
-const isPathWithinRoot = (rootDir: string, filePath: string): boolean => {
-  const root = path.resolve(rootDir);
-  const candidate = path.resolve(filePath);
-  return candidate === root || candidate.startsWith(root.endsWith(path.sep) ? root : `${root}${path.sep}`);
-};
-
-const resolveGeminiCliEntrypoint = async (): Promise<string> => {
-  const pkgJsonPath = nodeRequire.resolve('@google/gemini-cli/package.json');
-  const pkgDir = path.dirname(pkgJsonPath);
-  const pkg = JSON.parse(await readFile(pkgJsonPath, 'utf8')) as { bin?: string | Record<string, string> };
-  const binRel =
-    typeof pkg.bin === 'string'
-      ? pkg.bin
-      : typeof pkg.bin?.gemini === 'string'
-        ? pkg.bin.gemini
-        : pkg.bin && typeof pkg.bin === 'object'
-          ? Object.values(pkg.bin)[0]
-          : '';
-  if (!binRel) {
-    throw new Error('gemini_cli entrypoint not found in @google/gemini-cli package.json');
-  }
-  return path.resolve(pkgDir, binRel);
-};
-
-const buildPolicyToml = (allowTools: string[]): string => {
-  const toolsToml = allowTools.map((tool) => `"${String(tool).replace(/"/g, '\\"')}"`).join(', ');
-  return [
-    'version = "1.0"',
-    '',
-    '[[rules]]',
-    'id = "hookcode-auto-allow-core-tools"',
-    'description = "HookCode: auto-allow the configured core tools for non-interactive executions."',
-    `tools = [${toolsToml}]`,
-    'decision = "allow"',
-    ''
-  ].join('\n');
-};
-
-const parseJsonIfPossible = (line: string): unknown | null => {
+const parseJsonIfPossible = (line: string): Record<string, unknown> | null => {
   const trimmed = String(line ?? '').trim();
   if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) return null;
   try {
-    return JSON.parse(trimmed);
+    const parsed = JSON.parse(trimmed) as unknown;
+    return isRecord(parsed) ? parsed : null;
   } catch {
     return null;
   }
 };
 
-const getCodexThreadOptions = (params: {
-  repoDir: string;
-  workspaceDir?: string;
-  model: string;
-  sandbox: 'read-only' | 'workspace-write';
-  modelReasoningEffort: string;
-  includeModelReasoningEffort?: boolean;
-}) => {
-  const options: Record<string, unknown> = {
-    model: params.model,
-    sandboxMode: params.sandbox,
-    workingDirectory: params.workspaceDir ?? params.repoDir,
-    skipGitRepoCheck: true,
-    approvalPolicy: 'never',
-    networkAccessEnabled: true,
-    additionalDirectories: params.sandbox === 'workspace-write' ? [path.join(params.repoDir, '.git')] : undefined
-  };
-  if (params.includeModelReasoningEffort !== false) {
-    options.modelReasoningEffort = params.modelReasoningEffort;
-  }
-  return options;
+const captureTail = (current: string, next: string, maxLen = 2_000): string => {
+  const merged = `${current}\n${String(next ?? '')}`.trim();
+  return merged.length <= maxLen ? merged : merged.slice(merged.length - maxLen);
 };
 
-const UNKNOWN_REASONING_PARAM_PATTERN =
-  /unknown parameter:\s*['"]reasoning['"]|["']param["']\s*:\s*["']reasoning["']/i;
-const INVALID_REASONING_VALUE_PATTERN =
-  /reasoning.*(invalid|unsupported|not supported|must be one of|invalid enum|expected one of)|invalid.*reasoning/i;
+const resolveOutputPath = (repoDir: string, outputLastMessageFile: string): string =>
+  path.isAbsolute(outputLastMessageFile) ? outputLastMessageFile : path.join(repoDir, outputLastMessageFile);
 
-const isUnsupportedReasoningError = (message: string): boolean =>
-  UNKNOWN_REASONING_PARAM_PATTERN.test(message) || INVALID_REASONING_VALUE_PATTERN.test(message);
+const runCliProcess = async (params: {
+  command: string;
+  args: string[];
+  cwd: string;
+  env?: Record<string, string>;
+  stdinText?: string;
+  signal?: AbortSignal;
+  redact?: (text: string) => string;
+  logLine?: (line: string) => Promise<void>;
+  onStdoutLine?: (line: string) => void;
+  onStderrLine?: (line: string) => void;
+}): Promise<{ stdoutTail: string; stderrTail: string; exitCode: number | null; signal: NodeJS.Signals | null }> => {
+  const child = spawn(params.command, params.args, {
+    cwd: params.cwd,
+    env: params.env,
+    stdio: ['pipe', 'pipe', 'pipe']
+  });
 
-const getNextReasoningEffortFallback = (value: string): string | null => {
-  if (value === 'xhigh') return 'high';
-  if (value === 'high') return 'medium';
-  if (value === 'medium') return 'low';
-  return null;
+  const logger = createAsyncLineLogger({ logLine: params.logLine, redact: params.redact, maxQueueSize: 800 });
+  let stdoutTail = '';
+  let stderrTail = '';
+
+  const stdoutRl = readline.createInterface({ input: child.stdout });
+  const stderrRl = readline.createInterface({ input: child.stderr });
+
+  stdoutRl.on('line', (line) => {
+    stdoutTail = captureTail(stdoutTail, line);
+    logger.enqueue(line, { important: true });
+    params.onStdoutLine?.(line);
+  });
+
+  stderrRl.on('line', (line) => {
+    stderrTail = captureTail(stderrTail, line);
+    logger.enqueue(line, { important: true });
+    params.onStderrLine?.(line);
+  });
+
+  const abort = () => {
+    if (child.killed) return;
+    stopChildProcessTree(child, 'SIGTERM');
+    setTimeout(() => {
+      if (!child.killed) stopChildProcessTree(child, 'SIGKILL');
+    }, 1_500).unref();
+  };
+
+  if (params.signal) {
+    if (params.signal.aborted) abort();
+    else params.signal.addEventListener('abort', abort, { once: true });
+  }
+
+  try {
+    if (child.stdin) {
+      if (typeof params.stdinText === 'string') {
+        child.stdin.write(params.stdinText);
+      }
+      child.stdin.end();
+    }
+
+    const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
+      child.once('error', (error) => reject(error));
+      child.once('close', (code, signal) => resolve({ code, signal }));
+    });
+
+    stdoutRl.close();
+    stderrRl.close();
+    await logger.flushBestEffort(250);
+
+    return {
+      stdoutTail,
+      stderrTail,
+      exitCode: exit.code,
+      signal: exit.signal
+    };
+  } finally {
+    if (params.signal) {
+      params.signal.removeEventListener('abort', abort);
+    }
+  }
+};
+
+const buildCodexArgs = (params: {
+  repoDir: string;
+  workspaceDir: string;
+  model: string;
+  sandbox: 'read-only' | 'workspace-write';
+  resumeThreadId?: string;
+  outputLastMessageFile: string;
+  outputSchemaFile?: string;
+}) => {
+  const outputPath = resolveOutputPath(params.repoDir, params.outputLastMessageFile);
+  const args = params.resumeThreadId ? ['exec', 'resume', params.resumeThreadId] : ['exec'];
+  args.push('--json', '--skip-git-repo-check', '-C', params.workspaceDir, '-o', outputPath, '-s', params.sandbox);
+  if (params.model) args.push('-m', params.model);
+  if (params.sandbox === 'workspace-write') {
+    args.push('--add-dir', path.join(params.repoDir, '.git'));
+  }
+  if (params.outputSchemaFile) {
+    args.push('--output-schema', params.outputSchemaFile);
+  }
+  return args;
+};
+
+const CODEX_ENV_KEYS_TO_STRIP = ['OPENAI_API_KEY', 'OPENAI_BASE_URL', 'CODEX_HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME'] as const;
+
+const buildCodexConfigToml = (apiBaseUrl?: string): string | null => {
+  if (!apiBaseUrl) return null;
+  return [
+    'model_provider = "custom"',
+    'disable_response_storage = true',
+    '',
+    '[model_providers.custom]',
+    'name = "custom"',
+    'wire_api = "responses"',
+    'requires_openai_auth = true',
+    `base_url = ${JSON.stringify(apiBaseUrl)}`
+  ].join('\n');
+};
+
+const prepareIsolatedCodexHome = async (params: { apiKey?: string; apiBaseUrl?: string; parentDir: string }) => {
+  const apiKey = trimString(params.apiKey);
+  const apiBaseUrl = normalizeHttpBaseUrl(params.apiBaseUrl);
+  const runtimeRootDir = path.join(params.parentDir, '.hookcode-runtime');
+  await mkdir(runtimeRootDir, { recursive: true });
+  const homeDir = await mkdtemp(path.join(runtimeRootDir, 'codex-home-'));
+  const codexDir = path.join(homeDir, '.codex');
+  await mkdir(codexDir, { recursive: true });
+
+  if (apiKey) {
+    await writeFile(path.join(codexDir, 'auth.json'), JSON.stringify({ OPENAI_API_KEY: apiKey }, null, 2), 'utf8');
+  }
+
+  const configToml = buildCodexConfigToml(apiBaseUrl);
+  if (configToml) {
+    await writeFile(path.join(codexDir, 'config.toml'), `${configToml}\n`, 'utf8');
+  }
+
+  return {
+    homeDir,
+    apiBaseUrl,
+    hasApiKey: Boolean(apiKey)
+  };
 };
 
 export const runCodexExecWithSdk = async (params: {
@@ -175,125 +197,111 @@ export const runCodexExecWithSdk = async (params: {
   signal?: AbortSignal;
   redact?: (text: string) => string;
   logLine?: (line: string) => Promise<void>;
+  __internal?: {
+    runCliProcess?: typeof runCliProcess;
+    prepareIsolatedCodexHome?: typeof prepareIsolatedCodexHome;
+  };
 }): Promise<{ threadId: string | null; finalResponse: string }> => {
   const prompt = await readFile(params.promptFile, 'utf8');
-  const codexModule = await importResolvedPackage('@openai/codex-sdk');
-  const Codex = (codexModule.Codex ?? (isRecord(codexModule.default) ? codexModule.default.Codex : undefined)) as any;
-  if (!Codex) {
-    throw new Error('Failed to load Codex SDK: missing Codex export');
+  const workspaceDir = params.workspaceDir ?? params.repoDir;
+  const outputPath = resolveOutputPath(params.repoDir, params.outputLastMessageFile);
+  const schemaPath = params.outputSchema ? path.join(workspaceDir, '.hookcode-codex-output-schema.json') : undefined;
+  if (schemaPath) {
+    await writeFile(schemaPath, JSON.stringify(params.outputSchema, null, 2), 'utf8');
   }
-  const codexInitOptions: Record<string, unknown> = {
-    baseUrl: normalizeHttpBaseUrl(params.apiBaseUrl ?? ''),
-    env: buildMergedProcessEnv(params.env)
+
+  const runCli = params.__internal?.runCliProcess ?? runCliProcess;
+  const isolatedCodexHome = await (params.__internal?.prepareIsolatedCodexHome ?? prepareIsolatedCodexHome)({
+    apiKey: params.apiKey,
+    apiBaseUrl: params.apiBaseUrl,
+    parentDir: workspaceDir
+  });
+  const runtimeEnvOverrides: Record<string, string | undefined> = {
+    ...params.env,
+    HOME: isolatedCodexHome.homeDir,
+    USERPROFILE: isolatedCodexHome.homeDir
   };
-  if ((params.apiKey ?? '').trim()) codexInitOptions.apiKey = params.apiKey;
-  const codex = new Codex(codexInitOptions);
+  const mergedEnv = buildMergedProcessEnv(runtimeEnvOverrides);
+  for (const key of CODEX_ENV_KEYS_TO_STRIP) {
+    if (mergedEnv) delete mergedEnv[key];
+  }
+  if (params.logLine) {
+    await params.logLine(
+      `[codex] using isolated CLI home (apiBaseUrl=${isolatedCodexHome.apiBaseUrl ?? 'default'}, auth=${isolatedCodexHome.hasApiKey ? 'api_key' : 'none'}).`
+    );
+  }
 
-  const runOnce = async (reasoningEffort: string, resumeThreadId?: string): Promise<{ threadId: string | null; finalResponse: string }> => {
-    const threadOptions = getCodexThreadOptions({
-      repoDir: params.repoDir,
-      workspaceDir: params.workspaceDir,
-      model: params.model,
-      sandbox: params.sandbox,
-      modelReasoningEffort: reasoningEffort
-    });
-    const resumeId = String(resumeThreadId ?? '').trim();
-    const thread = resumeId
-      ? (() => {
-          try {
-            return codex.resumeThread(resumeId, threadOptions);
-          } catch {
-            return codex.startThread(threadOptions);
-          }
-        })()
-      : codex.startThread(threadOptions);
-
-    const logger = createAsyncLineLogger({ logLine: params.logLine, redact: params.redact, maxQueueSize: 500 });
-    const streamAbort = new AbortController();
-    if (params.signal) {
-      if (params.signal.aborted) streamAbort.abort(params.signal.reason);
-      else params.signal.addEventListener('abort', () => streamAbort.abort(params.signal?.reason), { once: true });
-    }
-
-    const turnOptions: Record<string, unknown> = { signal: streamAbort.signal };
-    if (params.outputSchema) turnOptions.outputSchema = params.outputSchema;
-    const { events } = await thread.runStreamed(prompt, turnOptions);
-    const iterator = events[Symbol.asyncIterator]();
+  const runOnce = async (resumeThreadId?: string): Promise<{ threadId: string | null; finalResponse: string }> => {
     let threadId: string | null = null;
     let finalResponse = '';
     let terminalError = '';
 
-    try {
-      while (true) {
-        const next = await iterator.next();
-        if (next.done) break;
-        const event = next.value as Record<string, unknown>;
-
-        if (event.type === 'thread.started' && typeof event.thread_id === 'string') {
-          threadId = event.thread_id.trim();
+    const { stdoutTail, stderrTail, exitCode, signal } = await runCli({
+      command: 'codex',
+      args: buildCodexArgs({
+        repoDir: params.repoDir,
+        workspaceDir,
+        model: params.model,
+        sandbox: params.sandbox,
+        resumeThreadId,
+        outputLastMessageFile: params.outputLastMessageFile,
+        outputSchemaFile: schemaPath
+      }),
+      cwd: workspaceDir,
+      env: mergedEnv,
+      stdinText: prompt,
+      signal: params.signal,
+      redact: params.redact,
+      logLine: params.logLine,
+      onStdoutLine: (line) => {
+        const parsed = parseJsonIfPossible(line);
+        if (!parsed) return;
+        if (parsed.type === 'thread.started' && typeof parsed.thread_id === 'string') {
+          threadId = parsed.thread_id.trim();
         }
         if (
-          (event.type === 'item.updated' || event.type === 'item.completed') &&
-          isRecord(event.item) &&
-          event.item.type === 'agent_message' &&
-          typeof event.item.text === 'string'
+          (parsed.type === 'item.updated' || parsed.type === 'item.completed') &&
+          isRecord(parsed.item) &&
+          parsed.item.type === 'agent_message' &&
+          typeof parsed.item.text === 'string'
         ) {
-          finalResponse = event.item.text;
+          finalResponse = parsed.item.text;
         }
-        if (event.type === 'turn.failed') {
-          terminalError = String(isRecord(event.error) ? event.error.message ?? 'codex turn failed' : 'codex turn failed');
+        if (parsed.type === 'turn.failed') {
+          terminalError = String(isRecord(parsed.error) ? parsed.error.message ?? 'codex turn failed' : 'codex turn failed');
         }
-        if (event.type === 'error') {
-          terminalError = String(event.message ?? 'codex stream error');
-        }
-
-        logger.enqueue(JSON.stringify(event), {
-          important:
-            event.type === 'thread.started' ||
-            event.type === 'turn.completed' ||
-            event.type === 'turn.failed' ||
-            event.type === 'error'
-        });
-
-        if (terminalError) {
-          if (!streamAbort.signal.aborted) streamAbort.abort(new Error('codex_stream_terminal_event'));
-          break;
+        if (parsed.type === 'error') {
+          terminalError = String(parsed.message ?? 'codex stream error');
         }
       }
-    } finally {
-      const returnFn = iterator.return?.bind(iterator);
-      if (returnFn) {
-        await Promise.race([
-          Promise.resolve(returnFn(undefined as never)).then(() => undefined).catch(() => undefined),
-          new Promise<void>((resolve) => setTimeout(resolve, 300))
-        ]);
-      }
-      await logger.flushBestEffort(250);
+    });
+
+    try {
+      finalResponse = await readFile(outputPath, 'utf8');
+    } catch {}
+
+    if (signal) throw new Error(`codex terminated by signal ${signal}`);
+    if (exitCode !== 0) {
+      const detail = [terminalError, stderrTail, stdoutTail].filter(Boolean).join('\n');
+      throw new Error(`codex exited with code ${exitCode}${detail ? `\n${detail}` : ''}`);
     }
-
-    const outputPath = path.isAbsolute(params.outputLastMessageFile)
-      ? params.outputLastMessageFile
-      : path.join(params.repoDir, params.outputLastMessageFile);
-    await writeFile(outputPath, finalResponse ?? '', 'utf8');
-
     if (terminalError) throw new Error(terminalError);
-    return { threadId: threadId ?? thread.id ?? null, finalResponse };
+    return { threadId: threadId ?? resumeThreadId ?? null, finalResponse };
   };
 
-  let reasoningEffort = params.modelReasoningEffort || 'medium';
-  while (true) {
-    try {
-      return await runOnce(reasoningEffort, params.resumeThreadId);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      if (!isUnsupportedReasoningError(message)) throw error;
-      const nextReasoning = getNextReasoningEffortFallback(reasoningEffort);
-      if (!nextReasoning) throw error;
-      if (params.logLine) {
-        await params.logLine(`[codex] remote API rejected reasoning effort ${reasoningEffort}; retrying with ${nextReasoning}.`);
-      }
-      reasoningEffort = nextReasoning;
+  try {
+    return await runOnce(trimString(params.resumeThreadId) || undefined);
+  } catch (error) {
+    if (!trimString(params.resumeThreadId)) throw error;
+    if (params.logLine) {
+      await params.logLine('[codex] resume failed; starting a new session');
     }
+    return await runOnce(undefined);
+  } finally {
+    if (schemaPath) {
+      await rm(schemaPath, { force: true }).catch(() => undefined);
+    }
+    await rm(isolatedCodexHome.homeDir, { recursive: true, force: true }).catch(() => undefined);
   }
 };
 
@@ -314,17 +322,8 @@ export const runClaudeCodeExecWithSdk = async (params: {
   logLine?: (line: string) => Promise<void>;
 }): Promise<{ threadId: string | null; finalResponse: string }> => {
   const prompt = await readFile(params.promptFile, 'utf8');
-  const claudeModule = await importResolvedPackage('@anthropic-ai/claude-agent-sdk');
-  const query = (claudeModule.query ?? (isRecord(claudeModule.default) ? claudeModule.default.query : undefined)) as Function | undefined;
-  if (typeof query !== 'function') {
-    throw new Error('Failed to load Claude Agent SDK: missing query export');
-  }
-  const abortController = new AbortController();
-  if (params.signal) {
-    if (params.signal.aborted) abortController.abort(params.signal.reason);
-    else params.signal.addEventListener('abort', () => abortController.abort(params.signal?.reason), { once: true });
-  }
-
+  const workspaceDir = params.workspaceDir ?? params.repoDir;
+  const outputPath = resolveOutputPath(params.repoDir, params.outputLastMessageFile);
   const baseTools = ['Read', 'Grep', 'Glob'];
   if (params.sandbox === 'workspace-write') baseTools.push('Edit', 'Write', 'Bash');
   if (params.networkAccess) baseTools.push('WebFetch', 'WebSearch');
@@ -336,101 +335,61 @@ export const runClaudeCodeExecWithSdk = async (params: {
   };
   if ((params.apiKey ?? '').trim()) runtimeEnvOverrides.ANTHROPIC_API_KEY = params.apiKey;
   const mergedEnv = buildMergedProcessEnv(runtimeEnvOverrides);
-  const workspaceRoot = params.workspaceDir ?? params.repoDir;
-  const resolveWorkspacePath = (rawPath: string): string => (path.isAbsolute(rawPath) ? rawPath : path.join(workspaceRoot, rawPath));
 
   const runOnce = async (resumeSessionId?: string): Promise<{ threadId: string | null; finalResponse: string }> => {
-    const logger = createAsyncLineLogger({ logLine: params.logLine, redact: params.redact, maxQueueSize: 500 });
     let threadId: string | null = null;
     let finalResponse = '';
     let resultError: string | null = null;
+    const args = [
+      '--print',
+      '--output-format',
+      'stream-json',
+      '--permission-mode',
+      'dontAsk',
+      '--allowedTools',
+      baseTools.join(','),
+      ...(params.model ? ['--model', params.model] : []),
+      ...(resumeSessionId ? ['--resume', resumeSessionId] : []),
+      ...(params.sandbox === 'workspace-write' ? ['--add-dir', path.join(params.repoDir, '.git')] : [])
+    ];
 
-    const stream = query({
-      prompt,
-      options: {
-        abortController,
-        cwd: workspaceRoot,
-        env: mergedEnv,
-        model: params.model || undefined,
-        tools: baseTools,
-        allowedTools: baseTools,
-        permissionMode: 'dontAsk',
-        persistSession: true,
-        resume: resumeSessionId ? resumeSessionId : undefined,
-        forkSession: false,
-        sandbox:
-          params.sandbox === 'workspace-write'
-            ? {
-                enabled: true,
-                autoAllowBashIfSandboxed: true,
-                allowUnsandboxedCommands: false
-              }
-            : { enabled: true },
-        additionalDirectories: params.sandbox === 'workspace-write' ? [path.join(params.repoDir, '.git')] : undefined,
-        canUseTool: async (toolName: string, input: unknown) => {
-          if (!baseTools.includes(toolName)) {
-            return { behavior: 'deny', message: 'Tool is not allowed by this robot configuration.' };
-          }
-
-          if ((toolName === 'Read' || toolName === 'Edit' || toolName === 'Write') && isRecord(input) && typeof input.file_path === 'string') {
-            if (!isPathWithinRoot(workspaceRoot, resolveWorkspacePath(input.file_path))) {
-              return { behavior: 'deny', message: 'File access outside the task-group workspace is not allowed.' };
-            }
-          }
-
-          if ((toolName === 'Grep' || toolName === 'Glob') && isRecord(input) && typeof input.path === 'string') {
-            const resolvedPath = input.path ? resolveWorkspacePath(input.path) : '';
-            if (resolvedPath && !isPathWithinRoot(workspaceRoot, resolvedPath)) {
-              return { behavior: 'deny', message: 'Search path outside the task-group workspace is not allowed.' };
-            }
-          }
-
-          if (toolName === 'Bash' && isRecord(input) && input.dangerouslyDisableSandbox === true) {
-            return { behavior: 'deny', message: 'Dangerously disabling sandbox is not allowed.', interrupt: true };
-          }
-
-          return { behavior: 'allow' };
-        }
-      }
-    }) as AsyncIterable<unknown>;
-
-    try {
-      for await (const message of stream) {
-        const payload = isRecord(message) ? message : {};
-        const sessionId = typeof payload.session_id === 'string' ? payload.session_id.trim() : '';
+    const { stdoutTail, stderrTail, exitCode, signal } = await runCliProcess({
+      command: 'claude',
+      args,
+      cwd: workspaceDir,
+      env: mergedEnv,
+      stdinText: prompt,
+      signal: params.signal,
+      redact: params.redact,
+      logLine: params.logLine,
+      onStdoutLine: (line) => {
+        const parsed = parseJsonIfPossible(line);
+        if (!parsed) return;
+        const sessionId = typeof parsed.session_id === 'string' ? parsed.session_id.trim() : '';
         if (sessionId && !threadId) threadId = sessionId;
-
-        if (payload.type === 'result') {
-          if (payload.subtype === 'success') {
-            finalResponse = typeof payload.result === 'string' ? payload.result : '';
+        if (parsed.type === 'result') {
+          if (parsed.subtype === 'success') {
+            finalResponse = typeof parsed.result === 'string' ? parsed.result : '';
           } else {
-            const errors = Array.isArray(payload.errors) ? payload.errors : [];
+            const errors = Array.isArray(parsed.errors) ? parsed.errors : [];
             resultError = errors.length > 0 ? String(errors[0]) : 'claude code execution failed';
           }
         }
-
-        logger.enqueue(toSafeJsonLine(message), {
-          important:
-            payload.type === 'result' ||
-            (payload.type === 'system' && payload.subtype === 'init') ||
-            payload.type === 'auth_status'
-        });
-        if (resultError) break;
       }
-    } finally {
-      await logger.flushBestEffort(250);
-    }
+    });
 
-    const outputPath = path.isAbsolute(params.outputLastMessageFile)
-      ? params.outputLastMessageFile
-      : path.join(params.repoDir, params.outputLastMessageFile);
     await writeFile(outputPath, finalResponse ?? '', 'utf8');
 
+    if (signal) throw new Error(`claude terminated by signal ${signal}`);
+    if (exitCode !== 0) {
+      const detail = [resultError, stderrTail, stdoutTail].filter(Boolean).join('\n');
+      throw new Error(`claude exited with code ${exitCode}${detail ? `\n${detail}` : ''}`);
+    }
     if (resultError) throw new Error(resultError);
-    return { threadId, finalResponse };
+    return { threadId: threadId ?? resumeSessionId ?? null, finalResponse };
   };
 
-  const resumeId = String(params.resumeSessionId ?? '').trim();
+  const resumeId = trimString(params.resumeSessionId);
   if (resumeId) {
     try {
       return await runOnce(resumeId);
@@ -461,11 +420,8 @@ export const runGeminiCliExecWithCli = async (params: {
   logLine?: (line: string) => Promise<void>;
 }): Promise<{ threadId: string | null; finalResponse: string }> => {
   const prompt = await readFile(params.promptFile, 'utf8');
-  const resolvedEntrypoint = await resolveGeminiCliEntrypoint();
   const workspaceDir = params.workspaceDir ?? params.repoDir;
-  const coreTools = ['list_directory', 'read_file', 'glob', 'search_file_content'];
-  if (params.sandbox === 'workspace-write') coreTools.push('write_file', 'replace', 'run_shell_command');
-  if (params.networkAccess) coreTools.push('web_fetch', 'google_web_search');
+  const outputPath = resolveOutputPath(params.repoDir, params.outputLastMessageFile);
 
   await mkdir(params.geminiHomeDir, { recursive: true });
   const localGeminiDir = path.join(os.homedir(), '.gemini');
@@ -477,129 +433,79 @@ export const runGeminiCliExecWithCli = async (params: {
     } catch {}
   }
 
-  const systemSettingsPath = path.join(params.geminiHomeDir, 'hookcode-gemini-system-settings.json');
-  await writeFile(
-    systemSettingsPath,
-    JSON.stringify(
-      {
-        tools: { core: coreTools, exclude: [] },
-        hooks: { enabled: false }
-      },
-      null,
-      2
-    ),
-    'utf8'
-  );
-
-  const policyDir = path.join(isolatedGeminiDir, 'policies');
-  await mkdir(policyDir, { recursive: true });
-  await writeFile(path.join(policyDir, 'hookcode.toml'), buildPolicyToml(coreTools), 'utf8');
+  const allowedTools = ['list_directory', 'read_file', 'glob', 'search_file_content'];
+  if (params.sandbox === 'workspace-write') allowedTools.push('write_file', 'replace', 'run_shell_command');
+  if (params.networkAccess) allowedTools.push('web_fetch', 'google_web_search');
 
   const apiBaseUrl = normalizeHttpBaseUrl(params.apiBaseUrl);
   const runtimeEnvOverrides: Record<string, string | undefined> = {
     ...params.env,
     ...(apiBaseUrl ? { GOOGLE_GEMINI_BASE_URL: apiBaseUrl } : {}),
     HOME: params.geminiHomeDir,
-    USERPROFILE: params.geminiHomeDir,
-    GEMINI_CLI_SYSTEM_SETTINGS_PATH: systemSettingsPath
+    USERPROFILE: params.geminiHomeDir
   };
   if ((params.apiKey ?? '').trim()) runtimeEnvOverrides.GEMINI_API_KEY = params.apiKey;
   const mergedEnv = buildMergedProcessEnv(runtimeEnvOverrides);
 
   const runOnce = async (resumeSessionId?: string): Promise<{ threadId: string | null; finalResponse: string }> => {
-    const child = spawn(process.execPath, [
-      resolvedEntrypoint,
-      '--output-format',
-      'stream-json',
-      ...(params.model ? ['--model', params.model] : []),
-      ...(resumeSessionId ? ['--resume', resumeSessionId] : [])
-    ], {
-      cwd: workspaceDir,
-      env: mergedEnv,
-      stdio: ['pipe', 'pipe', 'pipe']
-    });
-
-    const logger = createAsyncLineLogger({ logLine: params.logLine, redact: params.redact, maxQueueSize: 800 });
     let threadId: string | null = null;
     let finalResponse = '';
-    let stderrTail = '';
-    let stdoutTail = '';
+    let streamError = '';
+    const args = [
+      '--prompt',
+      prompt,
+      '--output-format',
+      'stream-json',
+      '--approval-mode',
+      params.sandbox === 'workspace-write' || params.networkAccess ? 'yolo' : 'default',
+      '--allowed-tools',
+      allowedTools.join(','),
+      ...(params.model ? ['--model', params.model] : []),
+      ...(resumeSessionId ? ['--resume', resumeSessionId] : []),
+      ...(params.sandbox === 'workspace-write' ? ['--include-directories', path.join(params.repoDir, '.git')] : [])
+    ];
 
-    const captureTail = (current: string, next: string, maxLen: number) => {
-      const merged = `${current}\n${next}`.trim();
-      return merged.length <= maxLen ? merged : merged.slice(merged.length - maxLen);
-    };
-
-    const stdoutRl = readline.createInterface({ input: child.stdout });
-    const stderrRl = readline.createInterface({ input: child.stderr });
-
-    stdoutRl.on('line', (line) => {
-      const raw = String(line ?? '');
-      stdoutTail = captureTail(stdoutTail, raw, 2000);
-      logger.enqueue(raw, { important: raw.includes('"type":"init"') || raw.includes('"type":"result"') });
-      const parsed = parseJsonIfPossible(raw);
-      if (!isRecord(parsed)) return;
-      if (parsed.type === 'init' && typeof parsed.session_id === 'string' && !threadId) {
-        threadId = parsed.session_id.trim();
-      }
-      if (parsed.type === 'result' && isRecord(parsed.result)) {
-        const output = typeof parsed.result.output === 'string' ? parsed.result.output : typeof parsed.result.text === 'string' ? parsed.result.text : '';
-        if (output.trim()) finalResponse = output.trimEnd();
+    const { stdoutTail, stderrTail, exitCode, signal } = await runCliProcess({
+      command: 'gemini',
+      args,
+      cwd: workspaceDir,
+      env: mergedEnv,
+      signal: params.signal,
+      redact: params.redact,
+      logLine: params.logLine,
+      onStdoutLine: (line) => {
+        const parsed = parseJsonIfPossible(line);
+        if (!parsed) return;
+        if (parsed.type === 'init' && typeof parsed.session_id === 'string' && !threadId) {
+          threadId = parsed.session_id.trim();
+        }
+        if (parsed.type === 'result' && isRecord(parsed.result)) {
+          const output =
+            typeof parsed.result.output === 'string'
+              ? parsed.result.output
+              : typeof parsed.result.text === 'string'
+                ? parsed.result.text
+                : '';
+          if (output.trim()) finalResponse = output.trimEnd();
+        }
+        if (parsed.type === 'error') {
+          streamError = String(parsed.message ?? parsed.error ?? 'gemini stream error');
+        }
       }
     });
 
-    stderrRl.on('line', (line) => {
-      const raw = String(line ?? '');
-      stderrTail = captureTail(stderrTail, raw, 2000);
-      logger.enqueue(raw, { important: true });
-    });
+    await writeFile(outputPath, finalResponse ?? '', 'utf8');
 
-    const abort = () => {
-      if (!child.killed) {
-        stopChildProcessTree(child, 'SIGTERM');
-      }
-      setTimeout(() => {
-        if (!child.killed) stopChildProcessTree(child, 'SIGKILL');
-      }, 1500).unref();
-    };
-
-    if (params.signal) {
-      if (params.signal.aborted) abort();
-      else params.signal.addEventListener('abort', abort, { once: true });
+    if (signal) throw new Error(`gemini terminated by signal ${signal}`);
+    if (exitCode !== 0) {
+      const detail = [streamError, stderrTail, stdoutTail].filter(Boolean).join('\n');
+      throw new Error(`gemini exited with code ${exitCode}${detail ? `\n${detail}` : ''}`);
     }
-
-    try {
-      if (child.stdin) {
-        child.stdin.write(prompt);
-        child.stdin.end();
-      }
-
-      const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
-        child.on('error', (error) => reject(error));
-        child.on('close', (code, signal) => resolve({ code, signal }));
-      });
-
-      stdoutRl.close();
-      stderrRl.close();
-
-      const outputPath = path.isAbsolute(params.outputLastMessageFile)
-        ? params.outputLastMessageFile
-        : path.join(params.repoDir, params.outputLastMessageFile);
-      await writeFile(outputPath, finalResponse ?? '', 'utf8');
-
-      if (exit.signal) throw new Error(`gemini_cli terminated by signal ${exit.signal}`);
-      if (exit.code !== 0) {
-        const detail = [stderrTail, stdoutTail].filter(Boolean).join('\n');
-        throw new Error(`gemini_cli exited with code ${exit.code}${detail ? `\n${detail}` : ''}`);
-      }
-
-      return { threadId, finalResponse };
-    } finally {
-      await logger.flushBestEffort(250);
-    }
+    if (streamError) throw new Error(streamError);
+    return { threadId: threadId ?? resumeSessionId ?? null, finalResponse };
   };
 
-  const resumeId = String(params.resumeSessionId ?? '').trim();
+  const resumeId = trimString(params.resumeSessionId);
   if (resumeId) {
     try {
       return await runOnce(resumeId);
@@ -611,3 +517,5 @@ export const runGeminiCliExecWithCli = async (params: {
   }
   return await runOnce(undefined);
 };
+
+export const __test__toSafeJsonLine = toSafeJsonLine;

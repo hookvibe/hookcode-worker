@@ -6,7 +6,7 @@ import { BackendInternalApiClient, type RemoteExecutionBundle } from '../backend
 import type { WorkerConfig } from '../config';
 import { stopChildProcessTree, xSpawnSync } from './crossPlatformSpawn';
 import { WorkerTaskExecutionError } from './executionError';
-import { prepareRuntimeProviders, resolvePreparedProviders } from './prepareRuntime';
+import { detectWorkerRuntimeState } from './runtimeDetection';
 import { normalizeWorkerProviderKey } from './providerRuntimeState';
 import { runClaudeCodeExecWithSdk, runCodexExecWithSdk, runGeminiCliExecWithCli } from './providerRunners';
 import { RepoChangeTracker } from './repoChangeTracker';
@@ -134,37 +134,62 @@ const flushBufferedOutput = (writeLine: ((line: string) => void) | undefined, bu
   if (writeLine && safeLine) writeLine(safeLine);
 };
 
-const ensureProviderRuntimesPrepared = async (params: {
-  config: WorkerConfig;
+const ensureProviderRuntimesAvailable = async (params: {
   bundle: RemoteExecutionBundle;
   writeLine: (line: string) => void;
-  prepareRuntime?: (providers: string[]) => Promise<void>;
 }) => {
-  const providers = Array.from(new Set(params.bundle.attempts.map((attempt) => trimString(attempt.provider)).filter(Boolean)));
+  const providers = Array.from(
+    new Set(
+      params.bundle.attempts
+        .map((attempt) => normalizeWorkerProviderKey(attempt.provider))
+        .filter(Boolean)
+    )
+  ) as Array<'codex' | 'claude_code' | 'gemini_cli'>;
   if (!providers.length) return;
 
-  params.writeLine(`[worker] ensuring provider runtimes: ${providers.join(', ')}`);
+  params.writeLine(`[worker] checking provider CLIs in environment: ${providers.join(', ')}`);
+  const runtimeState = detectWorkerRuntimeState(providers);
+  const unavailable = providers
+    .map((provider) => {
+      const entry = runtimeState.providerStatuses?.[provider];
+      if (entry?.status === 'ready') return null;
+      const label = provider === 'codex' ? 'Codex' : provider === 'claude_code' ? 'Claude Code' : 'Gemini CLI';
+      if (entry?.status === 'error') return `${label}: ${entry.error || 'environment probe failed'}`;
+      return `${label}: CLI not found on PATH`;
+    })
+    .filter(Boolean);
+  if (unavailable.length > 0) {
+    throw new Error(`worker machine is missing required provider CLIs: ${unavailable.join(' | ')}`);
+  }
+};
 
-  // Use the WorkerProcess-level prepareRuntime callback when available.
-  // This routes through the process-wide mutex and keeps runtimeState in sync
-  // with heartbeat reporting.  Falls back to the module-level serialised
-  // prepareRuntimeProviders() for direct invocations outside WorkerProcess.
-  if (params.prepareRuntime) {
-    await params.prepareRuntime(providers);
-  } else {
-    await prepareRuntimeProviders(params.config.runtimeInstallDir, providers);
+const getProviderAttemptExecutionBlocker = (attempt: RemoteExecutionBundle['attempts'][number]): string | null => {
+  if (!attempt.credential.canExecute) {
+    return attempt.credential.reason || `No executable credential is available for provider ${attempt.provider}`;
   }
 
-  // Lightweight verification — resolvePreparedProviders() just calls
-  // require.resolve() without triggering another install pass.
-  const preparedProviders = resolvePreparedProviders();
-  const missingProviders = providers.filter((provider) => {
-    const normalizedProvider = normalizeWorkerProviderKey(provider);
-    return normalizedProvider ? !preparedProviders.includes(normalizedProvider) : true;
-  });
-  if (missingProviders.length > 0) {
-    throw new Error(`worker runtime prepare failed for providers: ${missingProviders.join(', ')}`);
+  const provider = normalizeWorkerProviderKey(attempt.provider);
+  if (provider !== 'codex') return null;
+  if (trimString(attempt.credential.apiKey)) return null;
+
+  if (attempt.credential.resolvedMethod === 'auth_json_tokens') {
+    return 'Codex remote execution requires an API key-based credential. Backend resolved local OAuth tokens from ~/.codex/auth.json, but those tokens are not forwarded to remote workers.';
   }
+  if (attempt.credential.resolvedLayer === 'local') {
+    return 'Codex remote execution requires an API key-based credential. Backend resolved local machine auth without a transferable API key for the worker.';
+  }
+  return 'Codex remote execution requires an API key-based credential for the worker.';
+};
+
+const ensureProviderAttemptsExecutable = (params: {
+  bundle: RemoteExecutionBundle;
+}) => {
+  const blocked = params.bundle.attempts
+    .map((attempt) => ({ attempt, message: getProviderAttemptExecutionBlocker(attempt) }))
+    .filter((entry): entry is { attempt: RemoteExecutionBundle['attempts'][number]; message: string } => Boolean(entry.message));
+
+  if (blocked.length < params.bundle.attempts.length) return;
+  throw new Error(blocked.map(({ attempt, message }) => `${attempt.provider}: ${message}`).join(' | '));
 };
 
 const streamCommand = async (params: {
@@ -894,7 +919,6 @@ export const runRemoteTaskExecution = async (params: {
   signal: AbortSignal;
   stopReason?: 'manual_stop' | 'deleted';
   writeLine: (line: string) => void;
-  prepareRuntime?: (providers: string[]) => Promise<void>;
 }): Promise<RemoteTaskExecutionSuccess> => {
   const bundle = (await params.client.getTaskExecutionBundle(params.taskId)).bundle;
   const workspaceDir = path.join(params.config.workspaceRootDir, bundle.taskGroupId);
@@ -929,12 +953,8 @@ export const runRemoteTaskExecution = async (params: {
       'processing'
     );
 
-    await ensureProviderRuntimesPrepared({
-      config: params.config,
-      bundle,
-      writeLine: params.writeLine,
-      prepareRuntime: params.prepareRuntime
-    });
+    await ensureProviderRuntimesAvailable({ bundle, writeLine: params.writeLine });
+    ensureProviderAttemptsExecutable({ bundle });
 
     const { reuseWorkspace } = await prepareRepository({
       bundle,
@@ -1028,17 +1048,17 @@ export const runRemoteTaskExecution = async (params: {
         `[worker] provider routing attempt ${index + 1}/${bundle.attempts.length}: executing ${attempt.provider} (${attempt.role}).`
       );
 
-      if (!attempt.credential.canExecute) {
-        const message = attempt.credential.reason || `No executable credential is available for provider ${attempt.provider}`;
+      const executionBlocker = getProviderAttemptExecutionBlocker(attempt);
+      if (executionBlocker) {
         providerRouting = updateProviderRoutingAttempt(providerRouting, attempt.provider, {
           status: 'failed',
-          error: message,
-          reason: message,
+          error: executionBlocker,
+          reason: executionBlocker,
           finishedAt: new Date().toISOString()
         });
         await patchExecutionState();
         if (index === bundle.attempts.length - 1) {
-          throw new Error(message);
+          throw new Error(executionBlocker);
         }
         continue;
       }
@@ -1259,3 +1279,5 @@ export const runRemoteTaskExecution = async (params: {
     });
   }
 };
+
+export const __test__getProviderAttemptExecutionBlocker = getProviderAttemptExecutionBlocker;

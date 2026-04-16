@@ -11,13 +11,8 @@ import {
   WorkerToBackendMessage
 } from './protocol';
 import { detectHostCapabilities } from './runtime/hostCapabilities';
-import {
-  applyWorkerVendorNodePath,
-  prepareRuntimeProviders,
-  resolvePreparedProviders,
-  resolveTaskProvidersFromContext
-} from './runtime/prepareRuntime';
-import { markWorkerProviderReady, markWorkerProvidersPreparing, normalizeWorkerProviderKey, WORKER_PROVIDER_KEYS } from './runtime/providerRuntimeState';
+import { detectWorkerRuntimeState, resolveTaskProvidersFromContext } from './runtime/runtimeDetection';
+import { cloneWorkerRuntimeState, normalizeWorkerProviderKey } from './runtime/providerRuntimeState';
 import { WorkerTaskExecutionError } from './runtime/executionError';
 import { runTaskExecution } from './runtime/taskExecution';
 import { executeTaskWorkspaceOperation, TaskWorkspaceError } from './runtime/taskWorkspace';
@@ -42,7 +37,6 @@ export class WorkerProcess {
   private readonly pendingTaskIds: string[] = [];
   private readonly activeTasks = new Map<string, ActiveTaskEntry>();
   private runtimeState: WorkerRuntimeState;
-  private preparingRuntimePromise: Promise<void> | null = null;
   private capabilities: WorkerCapabilities;
   private shuttingDown = false;
 
@@ -50,20 +44,7 @@ export class WorkerProcess {
     this.config = config;
     this.client = new BackendInternalApiClient(config.backendUrl, config.workerId, config.workerToken);
     this.reconnectDelayMs = config.reconnectMinMs;
-    applyWorkerVendorNodePath(config.runtimeInstallDir);
-    // Seed provider-level readiness from the already-installed vendor directory so the backend can render Codex/Claude/Gemini availability immediately after connect. docs/en/developer/plans/7i9tp61el8rrb4r7j5xj/task_plan.md 7i9tp61el8rrb4r7j5xj
-    this.runtimeState = resolvePreparedProviders().reduce<WorkerRuntimeState>(
-      (state, provider) =>
-        markWorkerProviderReady(state, provider, {
-          finishedAt: new Date().toISOString()
-        }),
-      {
-        preparedProviders: [],
-        preparingProviders: [],
-        lastPrepareAt: undefined,
-        lastPrepareError: undefined
-      }
-    );
+    this.runtimeState = detectWorkerRuntimeState();
     this.capabilities = detectHostCapabilities(this.config.preview, this.runtimeState);
   }
 
@@ -128,13 +109,18 @@ export class WorkerProcess {
     this.capabilities = detectHostCapabilities(this.config.preview, this.runtimeState);
   }
 
+  private refreshRuntimeState(): void {
+    this.runtimeState = detectWorkerRuntimeState();
+    this.refreshCapabilities();
+  }
+
   private send(payload: WorkerToBackendMessage): void {
     if (!this.socket || this.socket.readyState !== WebSocket.OPEN) return;
     this.socket.send(JSON.stringify(payload));
   }
 
   private sendHello(): void {
-    this.refreshCapabilities();
+    this.refreshRuntimeState();
     this.send({
       type: 'hello',
       version: readPackageVersion(),
@@ -151,6 +137,7 @@ export class WorkerProcess {
   private startHeartbeat(): void {
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     this.heartbeatTimer = setInterval(() => {
+      this.refreshRuntimeState();
       this.send({
         type: 'heartbeat',
         runtimeState: this.runtimeState,
@@ -233,10 +220,6 @@ export class WorkerProcess {
       this.cancelTask(message.taskId);
       return;
     }
-    if (message.type === 'prepareRuntime') {
-      await this.prepareRuntime(message.providers);
-      return;
-    }
     if (message.type === 'ping') {
       this.sendHello();
       return;
@@ -264,60 +247,28 @@ export class WorkerProcess {
     activeTask.abortController.abort();
   }
 
-  private async prepareRuntime(providers?: string[]): Promise<void> {
+  private assertProvidersAvailable(providers?: string[]): void {
     const targetProviders = Array.from(
-      new Set((providers && providers.length > 0 ? providers : WORKER_PROVIDER_KEYS).map((provider) => normalizeWorkerProviderKey(provider)).filter(Boolean))
+      new Set((providers ?? []).map((provider) => normalizeWorkerProviderKey(provider)).filter(Boolean))
     ) as Array<'codex' | 'claude_code' | 'gemini_cli'>;
-    if (targetProviders.length === 0) return;
+    if (!targetProviders.length) return;
 
-    // If an install is already running, wait for it to finish first.
-    // After it completes, check whether the requested providers are now
-    // satisfied.  If any are still missing, a follow-up install pass will
-    // run (serialised by the module-level mutex in prepareRuntimeProviders).
-    if (this.preparingRuntimePromise) {
-      await this.preparingRuntimePromise;
-      const alreadyPrepared = this.runtimeState.preparedProviders ?? [];
-      const stillMissing = targetProviders.filter((p) => !alreadyPrepared.includes(p));
-      if (stillMissing.length === 0) return;
-      // Fall through to trigger a follow-up install for the missing providers.
+    this.refreshRuntimeState();
+    const runtimeState = cloneWorkerRuntimeState(this.runtimeState) ?? this.runtimeState;
+    const missingMessages = targetProviders
+      .map((provider) => {
+        const entry = runtimeState.providerStatuses?.[provider];
+        if (entry?.status === 'ready') return '';
+        const label = provider === 'codex' ? 'Codex' : provider === 'claude_code' ? 'Claude Code' : 'Gemini CLI';
+        if (entry?.status === 'error') {
+          return `${label} environment check failed: ${entry.error || 'unknown error'}`;
+        }
+        return `${label} CLI is not available on this worker machine`;
+      })
+      .filter(Boolean);
+    if (missingMessages.length > 0) {
+      throw new Error(missingMessages.join(' | '));
     }
-
-    this.runtimeState = markWorkerProvidersPreparing(this.runtimeState, targetProviders, new Date().toISOString());
-    this.send({ type: 'runtimePrepareStarted', providers: targetProviders, runtimeState: this.runtimeState });
-
-    this.preparingRuntimePromise = (async () => {
-      try {
-        this.runtimeState = await prepareRuntimeProviders(
-          this.config.runtimeInstallDir,
-          targetProviders,
-          this.runtimeState,
-          (runtimeState) => {
-            this.runtimeState = runtimeState;
-            this.refreshCapabilities();
-            this.send({ type: 'runtimePrepareStarted', providers: targetProviders, runtimeState: this.runtimeState });
-          }
-        );
-        this.refreshCapabilities();
-        this.send({ type: 'runtimePrepareFinished', providers: targetProviders, runtimeState: this.runtimeState });
-      } catch (error) {
-        this.runtimeState = {
-          ...this.runtimeState,
-          preparingProviders: [],
-          lastPrepareAt: new Date().toISOString(),
-          lastPrepareError: getErrorMessage(error)
-        };
-        this.send({
-          type: 'runtimePrepareFinished',
-          providers: targetProviders,
-          runtimeState: this.runtimeState,
-          error: this.runtimeState.lastPrepareError
-        });
-      } finally {
-        this.preparingRuntimePromise = null;
-      }
-    })();
-
-    return this.preparingRuntimePromise;
   }
 
   private async handleWorkspaceRequest(message: Extract<BackendToWorkerMessage, { type: 'workspaceRequest' }>): Promise<void> {
@@ -407,7 +358,7 @@ export class WorkerProcess {
         task: context.task ?? undefined,
         robotsInRepo: context.robotsInRepo ?? []
       });
-      await this.prepareRuntime(providers);
+      this.assertProvidersAvailable(providers);
       this.startTaskControlPolling(taskId, activeTask);
       const result = await runTaskExecution({
         client: this.client,
@@ -415,8 +366,7 @@ export class WorkerProcess {
         context,
         taskId,
         signal: activeTask.abortController.signal,
-        stopReason: activeTask.abortReason,
-        prepareRuntime: (p) => this.prepareRuntime(p)
+        stopReason: activeTask.abortReason
       });
       if (!result.handledByBackend) {
         // Skip duplicate finalization when the local worker delegated execution back to backend inline mode. docs/en/developer/plans/worker-executor-refactor-20260307/task_plan.md worker-executor-refactor-20260307

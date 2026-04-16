@@ -55,6 +55,6 @@ export const detectHostCapabilities = (preview: boolean, runtimeState: WorkerRun
   return {
     preview,
     runtimes,
-    providers: runtimeState.preparedProviders ?? []
+    providers: runtimeState.availableProviders ?? []
   };
 };

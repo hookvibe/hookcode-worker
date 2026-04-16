@@ -1,11 +1,10 @@
 import type {
   WorkerProviderKey,
-  WorkerProviderRuntimeEntry,
   WorkerProviderRuntimeStatuses,
   WorkerRuntimeState
 } from '../protocol';
 
-// Keep worker-side provider runtime bookkeeping in one place so incremental prepare progress stays consistent across websocket updates and heartbeat snapshots. docs/en/developer/plans/7i9tp61el8rrb4r7j5xj/task_plan.md 7i9tp61el8rrb4r7j5xj
+// Centralize worker-side provider availability derivation so hello/heartbeat payloads stay consistent with task-execution guards. docs/en/developer/plans/7i9tp61el8rrb4r7j5xj/task_plan.md 7i9tp61el8rrb4r7j5xj
 export const WORKER_PROVIDER_KEYS: WorkerProviderKey[] = ['codex', 'claude_code', 'gemini_cli'];
 
 const cloneProviderStatuses = (value?: WorkerProviderRuntimeStatuses | null): WorkerProviderRuntimeStatuses => {
@@ -17,13 +16,10 @@ const cloneProviderStatuses = (value?: WorkerProviderRuntimeStatuses | null): Wo
   return next;
 };
 
-const resolvePreparedProviders = (statuses: WorkerProviderRuntimeStatuses): WorkerProviderKey[] =>
+const resolveAvailableProviders = (statuses: WorkerProviderRuntimeStatuses): WorkerProviderKey[] =>
   WORKER_PROVIDER_KEYS.filter((provider) => statuses[provider]?.status === 'ready');
 
-const resolvePreparingProviders = (statuses: WorkerProviderRuntimeStatuses): WorkerProviderKey[] =>
-  WORKER_PROVIDER_KEYS.filter((provider) => statuses[provider]?.status === 'preparing');
-
-const resolveLastPrepareError = (statuses: WorkerProviderRuntimeStatuses): string | undefined => {
+const resolveLastCheckError = (statuses: WorkerProviderRuntimeStatuses): string | undefined => {
   const errors = WORKER_PROVIDER_KEYS
     .map((provider) => statuses[provider]?.error?.trim())
     .filter(Boolean);
@@ -41,77 +37,14 @@ export const buildWorkerRuntimeState = (
 ): WorkerRuntimeState => ({
   ...overrides,
   providerStatuses,
-  preparedProviders: resolvePreparedProviders(providerStatuses),
-  preparingProviders: resolvePreparingProviders(providerStatuses),
-  lastPrepareError: resolveLastPrepareError(providerStatuses) ?? overrides?.lastPrepareError
+  availableProviders: resolveAvailableProviders(providerStatuses),
+  lastCheckedAt: overrides?.lastCheckedAt,
+  lastCheckError: resolveLastCheckError(providerStatuses) ?? overrides?.lastCheckError
 });
 
-export const updateWorkerProviderRuntimeEntry = (
-  runtimeState: WorkerRuntimeState | undefined,
-  provider: WorkerProviderKey,
-  nextEntry: WorkerProviderRuntimeEntry,
-  overrides?: Partial<WorkerRuntimeState>
-): WorkerRuntimeState => {
-  const providerStatuses = cloneProviderStatuses(runtimeState?.providerStatuses);
-  providerStatuses[provider] = nextEntry;
-  return buildWorkerRuntimeState(providerStatuses, {
-    ...runtimeState,
-    ...overrides
+export const cloneWorkerRuntimeState = (runtimeState?: WorkerRuntimeState | null): WorkerRuntimeState | undefined => {
+  if (!runtimeState) return undefined;
+  return buildWorkerRuntimeState(cloneProviderStatuses(runtimeState.providerStatuses), {
+    ...runtimeState
   });
 };
-
-export const markWorkerProvidersPreparing = (
-  runtimeState: WorkerRuntimeState | undefined,
-  providers: WorkerProviderKey[],
-  startedAt: string
-): WorkerRuntimeState => {
-  let nextState = runtimeState;
-  for (const provider of providers) {
-    nextState = updateWorkerProviderRuntimeEntry(
-      nextState,
-      provider,
-      {
-        status: 'preparing',
-        startedAt,
-        finishedAt: undefined,
-        error: undefined
-      },
-      { lastPrepareAt: startedAt, lastPrepareError: undefined }
-    );
-  }
-  return nextState ?? { preparedProviders: [], preparingProviders: [], lastPrepareAt: startedAt };
-};
-
-export const markWorkerProviderReady = (
-  runtimeState: WorkerRuntimeState | undefined,
-  provider: WorkerProviderKey,
-  params: { startedAt?: string; finishedAt: string }
-): WorkerRuntimeState =>
-  updateWorkerProviderRuntimeEntry(
-    runtimeState,
-    provider,
-    {
-      status: 'ready',
-      startedAt: params.startedAt ?? runtimeState?.providerStatuses?.[provider]?.startedAt,
-      finishedAt: params.finishedAt,
-      error: undefined
-    },
-    { lastPrepareAt: params.finishedAt }
-  );
-
-export const markWorkerProviderError = (
-  runtimeState: WorkerRuntimeState | undefined,
-  provider: WorkerProviderKey,
-  params: { startedAt?: string; finishedAt: string; error: string }
-): WorkerRuntimeState =>
-  updateWorkerProviderRuntimeEntry(
-    runtimeState,
-    provider,
-    {
-      status: 'error',
-      startedAt: params.startedAt ?? runtimeState?.providerStatuses?.[provider]?.startedAt,
-      finishedAt: params.finishedAt,
-      error: params.error
-    },
-    { lastPrepareAt: params.finishedAt }
-  );
