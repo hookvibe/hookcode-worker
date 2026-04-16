@@ -3,8 +3,7 @@ import path from 'path';
 
 export interface WorkerCredentials {
   backendUrl: string;
-  workerId: string;
-  workerToken: string;
+  apiKey: string;
   configuredAt: string;
 }
 
@@ -17,11 +16,10 @@ export const readWorkerCredentials = (workDirRoot: string): WorkerCredentials | 
   try {
     const parsed = JSON.parse(readFileSync(filePath, 'utf8')) as Partial<WorkerCredentials>;
     const backendUrl = trimString(parsed.backendUrl).replace(/\/+$/, '');
-    const workerId = trimString(parsed.workerId);
-    const workerToken = trimString(parsed.workerToken);
+    const apiKey = trimString(parsed.apiKey);
     const configuredAt = trimString(parsed.configuredAt) || new Date().toISOString();
-    if (!backendUrl || !workerId || !workerToken) return null;
-    return { backendUrl, workerId, workerToken, configuredAt };
+    if (!backendUrl || !apiKey) return null;
+    return { backendUrl, apiKey, configuredAt };
   } catch {
     return null;
   }

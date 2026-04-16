@@ -28,9 +28,9 @@ export const showInfo = (workDirRoot: string): void => {
     return;
   }
 
-  console.log(`  Bind status:      bound`);
-  console.log(`  Worker ID:        ${credentials.workerId}`);
+  console.log(`  Bind status:      configured`);
   console.log(`  Backend URL:      ${credentials.backendUrl}`);
+  console.log(`  API key:          ${credentials.apiKey.slice(0, 8)}***`);
   console.log(`  Configured at:    ${credentials.configuredAt}`);
 
   try {
@@ -39,7 +39,7 @@ export const showInfo = (workDirRoot: string): void => {
     console.log(`  Worker kind:      ${config.workerKind}`);
     console.log(`  Worker name:      ${config.workerName}`);
     console.log(`  Max concurrency:  ${config.maxConcurrency}`);
-    console.log(`  Heartbeat:        ${config.heartbeatIntervalMs}ms`);
+    console.log(`  Poll interval:    ${config.pollIntervalMs}ms`);
     console.log(`  Runtime dir:      ${config.runtimeInstallDir}`);
     console.log(`  Workspace dir:    ${config.workspaceRootDir}`);
   } catch {

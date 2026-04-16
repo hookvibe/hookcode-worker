@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { registerWorkerBindCode } from './backend/registrationClient';
+import { verifyWorkerApiKey } from './backend/registrationClient';
 import { parseWorkerConfig, resolveWorkerRuntimeOptions } from './config';
 import { readWorkerCredentials, writeWorkerCredentials, type WorkerCredentials } from './credentials';
 import { loadWorkerEnvFile } from './envFile';
@@ -16,15 +16,9 @@ import { writePidFile, removePidFile } from './pidFile';
 
 const trimString = (value: unknown): string => (typeof value === 'string' ? value.trim() : '');
 
-const parseBoolean = (value: unknown): boolean => {
-  const raw = trimString(value).toLowerCase();
-  return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on';
-};
-
-const resolveBindCodeArg = (argv: string[]): string | undefined => {
+const resolveCliFlag = (argv: string[], flag: string): string | undefined => {
   for (let index = 0; index < argv.length; index += 1) {
-    const current = argv[index];
-    if (current !== '--bind-code') continue;
+    if (argv[index] !== flag) continue;
     return trimString(argv[index + 1]) || undefined;
   }
   return undefined;
@@ -32,15 +26,15 @@ const resolveBindCodeArg = (argv: string[]): string | undefined => {
 
 const hasHelpFlag = (argv: string[]): boolean => argv.includes('--help') || argv.includes('-h');
 
-const KNOWN_COMMANDS = ['configure', 'bind', 'run', 'start', 'stop', 'status', 'info', 'unbind', 'version', 'upgrade', 'help'] as const;
+const KNOWN_COMMANDS = ['configure', 'run', 'start', 'stop', 'status', 'info', 'unbind', 'version', 'upgrade', 'help'] as const;
 type Command = (typeof KNOWN_COMMANDS)[number];
 
-const configureWorker = async (bindCode: string, workDirRoot: string): Promise<WorkerCredentials> => {
-  const registered = await registerWorkerBindCode(bindCode);
+const configureWorker = async (backendUrl: string, apiKey: string, workDirRoot: string): Promise<WorkerCredentials> => {
+  const verified = await verifyWorkerApiKey(backendUrl, apiKey);
+  console.log(`[worker] API key verified — worker: ${verified.workerName} (${verified.workerId})`);
   const credentials: WorkerCredentials = {
-    backendUrl: registered.backendUrl,
-    workerId: registered.workerId,
-    workerToken: registered.workerToken,
+    backendUrl,
+    apiKey,
     configuredAt: new Date().toISOString()
   };
   writeWorkerCredentials(workDirRoot, credentials);
@@ -55,7 +49,6 @@ const main = async (): Promise<void> => {
 
   const argv = process.argv.slice(2);
 
-  // Global --help flag
   if (hasHelpFlag(argv)) {
     printHelp();
     return;
@@ -63,8 +56,8 @@ const main = async (): Promise<void> => {
 
   const command: Command = KNOWN_COMMANDS.includes(argv[0] as Command) ? (argv.shift()! as Command) : 'run';
   const runtimeOptions = resolveWorkerRuntimeOptions(process.env);
-  const bindCode = resolveBindCodeArg(argv) ?? runtimeOptions.bindCode;
-  const forceReconfigure = parseBoolean(process.env.HOOKCODE_WORKER_FORCE_RECONFIGURE);
+  const apiKeyArg = resolveCliFlag(argv, '--api-key') ?? trimString(process.env.HOOKCODE_WORKER_API_KEY);
+  const backendUrlArg = resolveCliFlag(argv, '--backend-url') ?? trimString(process.env.HOOKCODE_WORKER_BACKEND_URL);
 
   // --- Simple commands that don't need credentials ---
 
@@ -101,14 +94,17 @@ const main = async (): Promise<void> => {
     return;
   }
 
-  // --- Commands that register / bind ---
+  // --- Configure with API key ---
 
-  if (command === 'configure' || command === 'bind') {
-    if (!bindCode) {
-      throw new Error(`HOOKCODE_WORKER_BIND_CODE or --bind-code is required for "hookcode-worker ${command}".`);
+  if (command === 'configure') {
+    if (!apiKeyArg) {
+      throw new Error('HOOKCODE_WORKER_API_KEY or --api-key is required for "hookcode-worker configure".');
     }
-    const credentials = await configureWorker(bindCode, runtimeOptions.workDirRoot);
-    console.log(`[worker] configured ${credentials.workerId} in ${runtimeOptions.workDirRoot}`);
+    if (!backendUrlArg) {
+      throw new Error('HOOKCODE_WORKER_BACKEND_URL or --backend-url is required for "hookcode-worker configure".');
+    }
+    await configureWorker(backendUrlArg, apiKeyArg, runtimeOptions.workDirRoot);
+    console.log(`[worker] configured in ${runtimeOptions.workDirRoot}`);
     return;
   }
 
@@ -127,16 +123,13 @@ const main = async (): Promise<void> => {
   // --- Foreground run (default) ---
 
   let credentials = readWorkerCredentials(runtimeOptions.workDirRoot);
-  if (bindCode && (forceReconfigure || !credentials)) {
-    credentials = await configureWorker(bindCode, runtimeOptions.workDirRoot);
-    console.log(`[worker] registered ${credentials.workerId} from bind code`);
+  if (apiKeyArg && backendUrlArg && !credentials) {
+    credentials = await configureWorker(backendUrlArg, apiKeyArg, runtimeOptions.workDirRoot);
   }
 
-  // Write PID so "hookcode-worker status/stop" can detect this foreground process too.
   writePidFile(runtimeOptions.workDirRoot, process.pid);
   const cleanupPid = () => removePidFile(runtimeOptions.workDirRoot);
 
-  // Start the standalone worker entrypoint so backend-supervised and remote workers share the same protocol client.
   const worker = new WorkerProcess(parseWorkerConfig(process.env, credentials, runtimeOptions));
 
   const gracefulShutdown = async () => {

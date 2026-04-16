@@ -1,3 +1,5 @@
+import type { WorkerPollRequest, WorkerPollResponse, WorkerHeartbeatRequest } from '../protocol';
+
 export interface WorkerTaskContextResponse {
   task?: Record<string, unknown> | null;
   repo?: Record<string, unknown> | null;
@@ -74,8 +76,7 @@ const trimString = (value: unknown): string => (typeof value === 'string' ? valu
 export class BackendInternalApiClient {
   constructor(
     private readonly backendUrl: string,
-    private readonly workerId: string,
-    private readonly workerToken: string
+    private readonly apiKey: string
   ) {}
 
   private buildUrl(pathname: string): string {
@@ -85,14 +86,12 @@ export class BackendInternalApiClient {
   private buildHeaders(body?: unknown, extra?: HeadersInit): HeadersInit {
     return {
       ...(body === undefined ? {} : { 'content-type': 'application/json' }),
-      'x-hookcode-worker-id': this.workerId,
-      'x-hookcode-worker-token': this.workerToken,
+      authorization: `Bearer ${this.apiKey}`,
       ...(extra ?? {})
     };
   }
 
   private async request<T>(pathname: string, init?: RequestInit, options?: { allow404?: boolean }): Promise<T> {
-    // Route every stateful worker action through backend-owned APIs so the executor stays stateless and deployable anywhere. docs/en/developer/plans/worker-executor-refactor-20260307/task_plan.md worker-executor-refactor-20260307
     const response = await fetch(this.buildUrl(pathname), {
       ...init,
       headers: this.buildHeaders(init?.body, init?.headers)
@@ -126,20 +125,28 @@ export class BackendInternalApiClient {
     return this.request('/users/default-credentials');
   }
 
+  // ── Poll & Heartbeat ──
+
+  pollForTask(body: WorkerPollRequest): Promise<WorkerPollResponse> {
+    return this.request('/poll', {
+      method: 'POST',
+      body: JSON.stringify(body)
+    });
+  }
+
+  heartbeat(body: WorkerHeartbeatRequest): Promise<{ ok: boolean }> {
+    return this.request('/heartbeat', {
+      method: 'POST',
+      body: JSON.stringify(body)
+    });
+  }
+
   getTaskContext(taskId: string): Promise<WorkerTaskContextResponse> {
     return this.request(`/tasks/${encodeURIComponent(taskId)}/context`);
   }
 
   getTaskControlState(taskId: string): Promise<{ status: string; archivedAt?: string; stopRequested: boolean } | null> {
     return this.request(`/tasks/${encodeURIComponent(taskId)}/control-state`, undefined, { allow404: true });
-  }
-
-  executeInlineTask(taskId: string, reason?: 'missing_command'): Promise<{ success: true }> {
-    // Route commandless-task fallback through one internal endpoint so backend can gate when assigned workers may delegate execution back inline. docs/en/developer/plans/worker-executor-refactor-20260307/task_plan.md worker-executor-refactor-20260307
-    return this.request(`/tasks/${encodeURIComponent(taskId)}/execute-inline`, {
-      method: 'POST',
-      body: JSON.stringify({ reason })
-    });
   }
 
   getTaskExecutionBundle(taskId: string): Promise<{ bundle: RemoteExecutionBundle }> {

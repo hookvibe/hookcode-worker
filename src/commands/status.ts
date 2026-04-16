@@ -17,7 +17,7 @@ export const showStatus = (workDirRoot: string): void => {
   // Bind status
   if (credentials) {
     console.log(`  Bound:        yes`);
-    console.log(`  Worker ID:    ${credentials.workerId}`);
+    console.log(`  Backend URL:  ${credentials.backendUrl}`);
     console.log(`  Backend URL:  ${credentials.backendUrl}`);
     console.log(`  Configured:   ${credentials.configuredAt}`);
   } else {

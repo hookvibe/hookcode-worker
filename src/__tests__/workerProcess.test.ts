@@ -64,18 +64,14 @@ describe('WorkerProcess.start', () => {
   test('resolves startup and schedules reconnect when the first websocket attempt closes before open', async () => {
     const worker = new WorkerProcess({
       backendUrl: 'http://127.0.0.1:4000/api',
-      wsUrl: 'ws://127.0.0.1:4000/api/workers/connect?workerId=w1&token=t1',
-      workerId: 'w1',
-      workerToken: 't1',
+      apiKey: 'hkw_test-secret',
       workerName: 'Test Worker',
-      workerKind: 'local',
+      workerKind: 'remote',
       preview: true,
-      heartbeatIntervalMs: 10_000,
+      pollIntervalMs: 2_000,
       maxConcurrency: 1,
       runtimeInstallDir: '/tmp/hookcode-runtime',
       workspaceRootDir: '/tmp/hookcode-workspaces',
-      reconnectMinMs: 100,
-      reconnectMaxMs: 1_000,
       controlPollIntervalMs: 2_000,
       cancelKillTimeoutMs: 5_000,
       noopOnMissingCommand: false

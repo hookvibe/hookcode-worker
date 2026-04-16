@@ -3,6 +3,7 @@ import { spawn } from 'child_process';
 import { BackendInternalApiClient, WorkerTaskContextResponse } from '../backend/internalApiClient';
 import type { WorkerConfig } from '../config';
 import { stopChildProcessTree } from './crossPlatformSpawn';
+import { WorkerTaskExecutionError } from './executionError';
 import { TaskLogBatcher } from './logBatcher';
 import { RepoChangeTracker } from './repoChangeTracker';
 import { runRemoteTaskExecution } from './remoteTaskExecution';
@@ -188,9 +189,8 @@ export const runTaskExecution = async (params: {
           prepareRuntime: params.prepareRuntime
         });
       }
-      // Delegate commandless tasks back to backend inline execution until every worker-targeted task ships a runnable command envelope. Backend revalidates this fallback so remote workers cannot arbitrarily tunnel command-capable tasks back inline. docs/en/developer/plans/worker-executor-refactor-20260307/task_plan.md worker-executor-refactor-20260307
-      await params.client.executeInlineTask(params.taskId, 'missing_command');
-      return { handledByBackend: true };
+      // No remote execution path available and no command — fail the task.
+      throw new WorkerTaskExecutionError('Task has no executable command and no remote execution bundle is available.');
     }
 
     const env = buildTaskEnvironment({

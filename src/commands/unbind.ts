@@ -38,6 +38,6 @@ export const unbindWorker = async (workDirRoot: string): Promise<void> => {
   }
 
   clearWorkerCredentials(workDirRoot);
-  console.log(`[worker] unbound worker ${credentials.workerId} from ${credentials.backendUrl}.`);
+  console.log(`[worker] unbound worker from ${credentials.backendUrl}.`);
   console.log('[worker] credentials removed. The backend will mark this worker offline after heartbeat timeout.');
 };

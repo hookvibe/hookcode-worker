@@ -127,7 +127,6 @@ export const buildTaskEnvironment = (params: {
       Object.entries(process.env).filter((entry): entry is [string, string] => typeof entry[1] === 'string')
     ),
     HOOKCODE_BACKEND_URL: params.config.backendUrl,
-    HOOKCODE_WORKER_ID: params.config.workerId,
     HOOKCODE_WORKER_NAME: params.config.workerName,
     HOOKCODE_WORKER_KIND: params.config.workerKind,
     HOOKCODE_TASK_ID: trimString(task.id),
