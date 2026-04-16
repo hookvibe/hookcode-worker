@@ -7,6 +7,7 @@ import type { WorkerConfig } from '../config';
 import { stopChildProcessTree, xSpawnSync } from './crossPlatformSpawn';
 import { WorkerTaskExecutionError } from './executionError';
 import { prepareRuntimeProviders, resolvePreparedProviders } from './prepareRuntime';
+import { normalizeWorkerProviderKey } from './providerRuntimeState';
 import { runClaudeCodeExecWithSdk, runCodexExecWithSdk, runGeminiCliExecWithCli } from './providerRunners';
 import { RepoChangeTracker } from './repoChangeTracker';
 import {
@@ -157,7 +158,10 @@ const ensureProviderRuntimesPrepared = async (params: {
   // Lightweight verification — resolvePreparedProviders() just calls
   // require.resolve() without triggering another install pass.
   const preparedProviders = resolvePreparedProviders();
-  const missingProviders = providers.filter((provider) => !preparedProviders.includes(provider));
+  const missingProviders = providers.filter((provider) => {
+    const normalizedProvider = normalizeWorkerProviderKey(provider);
+    return normalizedProvider ? !preparedProviders.includes(normalizedProvider) : true;
+  });
   if (missingProviders.length > 0) {
     throw new Error(`worker runtime prepare failed for providers: ${missingProviders.join(', ')}`);
   }

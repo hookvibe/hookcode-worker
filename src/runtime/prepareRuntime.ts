@@ -1,10 +1,17 @@
 import type { SpawnSyncOptions, SpawnSyncReturns } from 'child_process';
 import { mkdir, readFile, writeFile } from 'fs/promises';
 import path from 'path';
-import type { WorkerRuntimeState } from '../protocol';
+import type { WorkerProviderKey, WorkerRuntimeState } from '../protocol';
+import {
+  markWorkerProviderError,
+  markWorkerProviderReady,
+  markWorkerProvidersPreparing,
+  normalizeWorkerProviderKey,
+  WORKER_PROVIDER_KEYS
+} from './providerRuntimeState';
 import { xSpawn, xSpawnSync } from './crossPlatformSpawn';
 
-const PROVIDER_PACKAGES: Record<string, string[]> = {
+const PROVIDER_PACKAGES: Record<WorkerProviderKey, string[]> = {
   codex: ['@openai/codex-sdk'],
   claude_code: ['@anthropic-ai/claude-agent-sdk'],
   gemini_cli: ['@google/gemini-cli']
@@ -121,10 +128,10 @@ export const applyWorkerVendorNodePath = (vendorDir: string): void => {
   applyNodePath(vendorDir);
 };
 
-export const resolvePreparedProviders = (): string[] => {
+export const resolvePreparedProviders = (): WorkerProviderKey[] => {
   return Object.entries(PROVIDER_PACKAGES)
     .filter(([, packages]) => packages.every((pkg) => packageIsResolvable(pkg)))
-    .map(([provider]) => provider);
+    .map(([provider]) => provider as WorkerProviderKey);
 };
 
 /**
@@ -132,56 +139,60 @@ export const resolvePreparedProviders = (): string[] => {
  */
 const prepareRuntimeProvidersInternal = async (
   vendorDir: string,
-  targets: string[],
-  priorState?: WorkerRuntimeState
+  targets: WorkerProviderKey[],
+  priorState?: WorkerRuntimeState,
+  onStateChange?: (runtimeState: WorkerRuntimeState) => void
 ): Promise<WorkerRuntimeState> => {
-  const runtimeState: WorkerRuntimeState = {
-    preparedProviders: priorState?.preparedProviders ?? resolvePreparedProviders(),
-    preparingProviders: targets,
-    lastPrepareAt: new Date().toISOString(),
-    lastPrepareError: undefined
-  };
   applyNodePath(vendorDir);
+  let runtimeState = markWorkerProvidersPreparing(priorState, targets, new Date().toISOString());
+  onStateChange?.(runtimeState);
 
-  try {
-    const missingPackages = Array.from(
-      new Set(targets.flatMap((provider) => PROVIDER_PACKAGES[provider] ?? []).filter((pkg) => !packageIsResolvable(pkg)))
-    );
-    if (missingPackages.length > 0) {
-      // Install provider runtimes only when requested so the distributed worker package can remain small by default. docs/en/developer/plans/worker-executor-refactor-20260307/task_plan.md worker-executor-refactor-20260307
-      await installPackages(vendorDir, missingPackages);
-      applyNodePath(vendorDir);
+  for (const provider of targets) {
+    const startedAt = runtimeState.providerStatuses?.[provider]?.startedAt ?? new Date().toISOString();
+    runtimeState = markWorkerProvidersPreparing(runtimeState, [provider], startedAt);
+    onStateChange?.(runtimeState);
 
-      // Verify packages are actually resolvable after install (file system caching may delay visibility).
-      const stillMissing: string[] = [];
-      for (const pkg of missingPackages) {
-        if (!(await packageIsResolvableWithRetry(pkg))) {
-          stillMissing.push(pkg);
+    try {
+      const missingPackages = Array.from(
+        new Set((PROVIDER_PACKAGES[provider] ?? []).filter((pkg) => !packageIsResolvable(pkg)))
+      );
+      if (missingPackages.length > 0) {
+        // Install provider runtimes one provider at a time so the backend can show live Codex/Claude/Gemini progress instead of one opaque bulk step. docs/en/developer/plans/7i9tp61el8rrb4r7j5xj/task_plan.md 7i9tp61el8rrb4r7j5xj
+        await installPackages(vendorDir, missingPackages);
+        applyNodePath(vendorDir);
+
+        const stillMissing: string[] = [];
+        for (const pkg of missingPackages) {
+          if (!(await packageIsResolvableWithRetry(pkg))) {
+            stillMissing.push(pkg);
+          }
+        }
+        if (stillMissing.length > 0) {
+          runtimeState = markWorkerProviderError(runtimeState, provider, {
+            startedAt,
+            finishedAt: new Date().toISOString(),
+            error: `packages installed but not resolvable: ${stillMissing.join(', ')}`
+          });
+          onStateChange?.(runtimeState);
+          continue;
         }
       }
-      if (stillMissing.length > 0) {
-        return {
-          preparedProviders: resolvePreparedProviders(),
-          preparingProviders: [],
-          lastPrepareAt: new Date().toISOString(),
-          lastPrepareError: `packages installed but not resolvable: ${stillMissing.join(', ')}`
-        };
-      }
+
+      runtimeState = markWorkerProviderReady(runtimeState, provider, {
+        startedAt,
+        finishedAt: new Date().toISOString()
+      });
+      onStateChange?.(runtimeState);
+    } catch (error) {
+      runtimeState = markWorkerProviderError(runtimeState, provider, {
+        startedAt,
+        finishedAt: new Date().toISOString(),
+        error: error instanceof Error ? error.message : String(error)
+      });
+      onStateChange?.(runtimeState);
     }
-    return {
-      preparedProviders: resolvePreparedProviders(),
-      preparingProviders: [],
-      lastPrepareAt: new Date().toISOString(),
-      lastPrepareError: undefined
-    };
-  } catch (error) {
-    return {
-      preparedProviders: resolvePreparedProviders(),
-      preparingProviders: [],
-      lastPrepareAt: new Date().toISOString(),
-      lastPrepareError: error instanceof Error ? error.message : String(error)
-    };
   }
+  return runtimeState;
 };
 
 /**
@@ -195,9 +206,12 @@ const prepareRuntimeProvidersInternal = async (
 export const prepareRuntimeProviders = async (
   vendorDir: string,
   providers?: string[],
-  priorState?: WorkerRuntimeState
+  priorState?: WorkerRuntimeState,
+  onStateChange?: (runtimeState: WorkerRuntimeState) => void
 ): Promise<WorkerRuntimeState> => {
-  const targets = Array.from(new Set((providers ?? Object.keys(PROVIDER_PACKAGES)).filter((provider) => provider in PROVIDER_PACKAGES)));
+  const targets = Array.from(
+    new Set((providers ?? WORKER_PROVIDER_KEYS).map((provider) => normalizeWorkerProviderKey(provider)).filter(Boolean))
+  ) as WorkerProviderKey[];
 
   // Wait for any in-flight install to finish before starting a new one.
   if (activeInstallPromise) {
@@ -213,6 +227,7 @@ export const prepareRuntimeProviders = async (
   const remaining = targets.filter((provider) => !alreadyPrepared.includes(provider));
   if (remaining.length === 0) {
     return {
+      providerStatuses: priorState?.providerStatuses,
       preparedProviders: alreadyPrepared,
       preparingProviders: [],
       lastPrepareAt: new Date().toISOString(),
@@ -220,7 +235,7 @@ export const prepareRuntimeProviders = async (
     };
   }
 
-  const promise = prepareRuntimeProvidersInternal(vendorDir, remaining, priorState);
+  const promise = prepareRuntimeProvidersInternal(vendorDir, remaining, priorState, onStateChange);
   activeInstallPromise = promise;
   try {
     return await promise;
@@ -234,7 +249,7 @@ export const prepareRuntimeProviders = async (
 export const resolveTaskProvidersFromContext = (context: {
   task?: Record<string, unknown> | null;
   robotsInRepo?: Array<Record<string, unknown>>;
-}): string[] => {
+}): WorkerProviderKey[] => {
   const robotId = typeof context.task?.robotId === 'string' ? context.task.robotId : '';
   const robot = Array.isArray(context.robotsInRepo)
     ? context.robotsInRepo.find((entry) => String(entry?.id ?? '') === robotId)
@@ -248,6 +263,8 @@ export const resolveTaskProvidersFromContext = (context: {
     routingConfig && typeof routingConfig === 'object' && !Array.isArray(routingConfig)
       ? String((routingConfig as Record<string, unknown>).fallbackProvider ?? '').trim()
       : '';
-  const providers = [provider, fallbackProvider].filter((entry) => entry in PROVIDER_PACKAGES);
+  const providers = [provider, fallbackProvider]
+    .map((entry) => normalizeWorkerProviderKey(entry))
+    .filter(Boolean) as WorkerProviderKey[];
   return providers.length > 0 ? Array.from(new Set(providers)) : ['codex'];
 };

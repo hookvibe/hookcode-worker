@@ -17,6 +17,7 @@ import {
   resolvePreparedProviders,
   resolveTaskProvidersFromContext
 } from './runtime/prepareRuntime';
+import { markWorkerProviderReady, markWorkerProvidersPreparing, normalizeWorkerProviderKey, WORKER_PROVIDER_KEYS } from './runtime/providerRuntimeState';
 import { WorkerTaskExecutionError } from './runtime/executionError';
 import { runTaskExecution } from './runtime/taskExecution';
 import { executeTaskWorkspaceOperation, TaskWorkspaceError } from './runtime/taskWorkspace';
@@ -50,12 +51,19 @@ export class WorkerProcess {
     this.client = new BackendInternalApiClient(config.backendUrl, config.workerId, config.workerToken);
     this.reconnectDelayMs = config.reconnectMinMs;
     applyWorkerVendorNodePath(config.runtimeInstallDir);
-    this.runtimeState = {
-      preparedProviders: resolvePreparedProviders(),
-      preparingProviders: [],
-      lastPrepareAt: undefined,
-      lastPrepareError: undefined
-    };
+    // Seed provider-level readiness from the already-installed vendor directory so the backend can render Codex/Claude/Gemini availability immediately after connect. docs/en/developer/plans/7i9tp61el8rrb4r7j5xj/task_plan.md 7i9tp61el8rrb4r7j5xj
+    this.runtimeState = resolvePreparedProviders().reduce<WorkerRuntimeState>(
+      (state, provider) =>
+        markWorkerProviderReady(state, provider, {
+          finishedAt: new Date().toISOString()
+        }),
+      {
+        preparedProviders: [],
+        preparingProviders: [],
+        lastPrepareAt: undefined,
+        lastPrepareError: undefined
+      }
+    );
     this.capabilities = detectHostCapabilities(this.config.preview, this.runtimeState);
   }
 
@@ -257,7 +265,10 @@ export class WorkerProcess {
   }
 
   private async prepareRuntime(providers?: string[]): Promise<void> {
-    const targetProviders = providers && providers.length > 0 ? providers : ['codex', 'claude_code', 'gemini_cli'];
+    const targetProviders = Array.from(
+      new Set((providers && providers.length > 0 ? providers : WORKER_PROVIDER_KEYS).map((provider) => normalizeWorkerProviderKey(provider)).filter(Boolean))
+    ) as Array<'codex' | 'claude_code' | 'gemini_cli'>;
+    if (targetProviders.length === 0) return;
 
     // If an install is already running, wait for it to finish first.
     // After it completes, check whether the requested providers are now
@@ -271,17 +282,21 @@ export class WorkerProcess {
       // Fall through to trigger a follow-up install for the missing providers.
     }
 
-    this.runtimeState = {
-      ...this.runtimeState,
-      preparingProviders: targetProviders,
-      lastPrepareAt: new Date().toISOString(),
-      lastPrepareError: undefined
-    };
-    this.send({ type: 'runtimePrepareStarted', providers: targetProviders });
+    this.runtimeState = markWorkerProvidersPreparing(this.runtimeState, targetProviders, new Date().toISOString());
+    this.send({ type: 'runtimePrepareStarted', providers: targetProviders, runtimeState: this.runtimeState });
 
     this.preparingRuntimePromise = (async () => {
       try {
-        this.runtimeState = await prepareRuntimeProviders(this.config.runtimeInstallDir, targetProviders, this.runtimeState);
+        this.runtimeState = await prepareRuntimeProviders(
+          this.config.runtimeInstallDir,
+          targetProviders,
+          this.runtimeState,
+          (runtimeState) => {
+            this.runtimeState = runtimeState;
+            this.refreshCapabilities();
+            this.send({ type: 'runtimePrepareStarted', providers: targetProviders, runtimeState: this.runtimeState });
+          }
+        );
         this.refreshCapabilities();
         this.send({ type: 'runtimePrepareFinished', providers: targetProviders, runtimeState: this.runtimeState });
       } catch (error) {
